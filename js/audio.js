@@ -113,13 +113,15 @@ export function timeStretch(chs, speed, keepPitch = true) {
 // 最終的な音声（48kHz ステレオ）を作る
 // orig: { channels: Float32Array[], sampleRate } … 元動画の音声（trimIn〜trimOut の範囲）。無ければ null
 // buffers: Map(audioClipId -> AudioBuffer)
-export function mixProject(p, orig, buffers) {
+// afx: 元の動画の音声にかける EQ・エフェクトの設定（dsp.js の Chain の params）。null なら何もしない
+export function mixProject(p, orig, buffers, afx = null) {
   const total = Math.ceil(timelineDuration(p) * SR);
   const L = new Float32Array(total), R = new Float32Array(total);
 
   if (orig && p.origVolume > 0) {
     let chs = orig.channels.map((c) => resample(c, orig.sampleRate, SR));
     chs = timeStretch(chs, p.speed, p.keepPitch);
+    if (afx && globalThis.DSP) chs = globalThis.DSP.processBuffers(SR, chs[0], chs[1] || chs[0], afx);
     const l = chs[0], r = chs[1] || chs[0];
     const n = Math.min(total, l.length);
     const g = p.origVolume;

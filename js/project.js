@@ -22,6 +22,7 @@ export function createProject(src) {
     texts: [],
     audios: [],
     effects: [],
+    afx: null, // 元の動画の音声の補正（EQ・エフェクト）。最初に「音声補正」を開いたときに作る
   };
 }
 

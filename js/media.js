@@ -137,7 +137,7 @@ export async function exportVideo({ media, proj, buffers, settings, onProgress, 
   }
   if (signal?.aborted) throw new DOMException('canceled', 'AbortError');
   const hasAudio = !!orig || proj.audios.some((a) => buffers.get(a.id));
-  const mix = hasAudio ? mixProject(proj, orig, buffers) : null;
+  const mix = hasAudio ? mixProject(proj, orig, buffers, settings.afx) : null;
   orig = null;
   report('audio', 1);
 
