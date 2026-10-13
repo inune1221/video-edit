@@ -23,12 +23,12 @@
   <section id="start" class="screen">
     <header class="bar"><h1>動画編集</h1></header>
     <label class="pick">
-      <input type="file" id="file" accept="video/*,.mov,.mp4,.m4v" hidden>
+      <input type="file" id="file" accept="video/*,.mov,.mp4,.m4v" multiple hidden>
       <span class="pick-icon" aria-hidden="true">
         <svg viewBox="0 0 24 24"><path d="M4 6h11a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1zm12 4 5-3v10l-5-3"/></svg>
       </span>
       <span class="pick-title">動画を選ぶ</span>
-      <span class="muted">4K / フルHD に対応・書き出し無制限</span>
+      <span class="muted">4K / フルHD に対応・書き出し無制限<br>複数選ぶと順番につなげます</span>
     </label>
     <div class="note">
       <p><b>画質を落とさないコツ</b></p>
@@ -53,7 +53,7 @@
   <section id="editor" hidden>
     <header class="ebar">
       <label class="icon-btn" aria-label="別の動画を開く">
-        <input type="file" id="file2" accept="video/*,.mov,.mp4,.m4v" hidden>
+        <input type="file" id="file2" accept="video/*,.mov,.mp4,.m4v" multiple hidden>
         <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
       </label>
       <button class="icon-btn" id="undo" aria-label="元に戻す"><svg viewBox="0 0 24 24"><path d="M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg></button>
@@ -63,8 +63,7 @@
     </header>
 
     <div class="stage" id="stage">
-      <video id="video" playsinline muted preload="auto"></video>
-      <canvas id="preview"></canvas>
+            <canvas id="preview"></canvas>
     </div>
 
     <div class="transport">
@@ -83,6 +82,7 @@
       </div>
       <div class="ctxbar" id="ctxbar" hidden></div>
       <nav class="tools" id="tools">
+        <button data-tool="addvideo"><svg viewBox="0 0 24 24"><rect x="2" y="5" width="14" height="14" rx="2"/><path d="M19 8v8M15 12h8"/></svg>動画追加</button>
         <button data-tool="text"><svg viewBox="0 0 24 24"><path d="M5 6V4h14v2M12 4v16M9 20h6"/></svg>テキスト</button>
         <button data-tool="tts"><svg viewBox="0 0 24 24"><path d="M4 10v4M8 7v10M12 4v16M16 8v8M20 11v2"/></svg>読み上げ</button>
         <button data-tool="music"><svg viewBox="0 0 24 24"><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg>音楽</button>
@@ -102,6 +102,7 @@
       </div>
     </div>
     <input type="file" id="audioFile" accept="audio/*,video/*,.mp3,.m4a,.wav,.aac,.caf,.aiff" hidden>
+    <input type="file" id="addVideo" accept="video/*,.mov,.mp4,.m4v" multiple hidden>
     <input type="file" id="ovFile" accept="image/*,video/*,.mov,.mp4,.m4v,.heic,.png,.jpg,.jpeg,.webp,.gif" hidden>
     <input type="file" id="ttsFile" accept="audio/*,.m4a,.wav,.aiff,.caf,.mp3" hidden>
   </section>
@@ -126,6 +127,7 @@
         <div class="sheet-title">完成しました</div>
         <video id="resultVideo" playsinline controls></video>
         <p class="lbl" id="doneMsg"></p>
+        <div id="doneList"></div>
         <button class="primary" id="share">写真に保存 / 共有</button>
         <a class="btn wide" id="download">ファイルとして保存</a>
         <button class="wide" id="closeSheet">閉じる</button>

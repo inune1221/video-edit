@@ -5,8 +5,8 @@ import {
   CanvasSource, AudioBufferSource, Conversion, canEncodeVideo, canEncodeAudio,
 } from './vendor/mediabunny.min.mjs';
 import { renderFrame } from './render.js';
-import { outputSize, timelineDuration } from './project.js';
-import { mixProject, SR } from './audio.js';
+import { outputSize, timelineDuration, clipTimes, fitRect } from './project.js';
+import { mixProject, SR, resample, timeStretch } from './audio.js';
 
 const COMMON_FPS = [23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60, 120];
 
@@ -124,7 +124,31 @@ export async function detectEncoders(w, h, fps, extra = []) {
 
 // settings: { limit: 'auto'|1080|720, fps, codec: 'avc'|'hevc', quality: 'high'|'max' }
 // overlayMedia: Map(mediaId -> { type, file, bitmap, width, height, duration, fps })（重ねる画像・動画）
-export async function exportVideo({ media, proj, buffers, overlayMedia = new Map(), settings, onProgress, signal }) {
+// メインの動画クリップの音声をつなげる（速度変更・クリップごとの音量を反映）。48kHz ステレオ
+export async function buildMainAudio(proj, srcs, onProgress) {
+  const total = Math.ceil(timelineDuration(proj) * SR);
+  const L = new Float32Array(total), R = new Float32Array(total);
+  let any = false;
+  const ts = clipTimes(proj);
+  for (const x of ts) {
+    const s = srcs.get(x.clip.srcId);
+    if (!s || !s.media.audioTrack || x.clip.volume <= 0) continue;
+    const a = await decodeSourceAudio(s.media, x.clip.in, x.clip.out);
+    if (!a) continue;
+    let chs = a.channels.map((c) => resample(c, a.sampleRate, SR));
+    if (chs.length < 2) chs = [chs[0], chs[0]];
+    chs = timeStretch(chs, x.clip.speed, x.clip.keepPitch);
+    const at = Math.round(x.start * SR), n = Math.min(chs[0].length, Math.round((x.end - x.start) * SR), total - at);
+    const g = x.clip.volume;
+    for (let i = 0; i < n; i++) { L[at + i] += chs[0][i] * g; R[at + i] += chs[1][i] * g; }
+    any = true;
+    onProgress && onProgress((x.index + 1) / ts.length);
+  }
+  return any ? [L, R] : null;
+}
+
+// srcs: Map(srcId -> { media（openVideo の結果） })
+export async function exportVideo({ srcs, proj, buffers, overlayMedia = new Map(), settings, onProgress, signal }) {
   const report = (phase, k, extra) => onProgress && onProgress(phase, k, extra);
   const { w: W, h: H } = outputSize(proj, settings.limit);
   const fps = settings.fps;
@@ -133,9 +157,7 @@ export async function exportVideo({ media, proj, buffers, overlayMedia = new Map
   // 1) 音声
   report('audio', 0);
   let orig = null;
-  if (media.audioTrack && proj.origVolume > 0) {
-    orig = await decodeSourceAudio(media, proj.trimIn, proj.trimOut, (k) => report('audio', k * 0.7));
-  }
+  if (proj.origVolume > 0) orig = await buildMainAudio(proj, srcs, (k) => report('audio', k * 0.7));
   if (signal?.aborted) throw new DOMException('canceled', 'AbortError');
   const hasAudio = !!orig || proj.audios.some((a) => buffers.get(a.id)) || (proj.overlays || []).some((o) => o.type === 'video' && o.volume > 0 && buffers.get(o.mediaId));
   const mix = hasAudio ? mixProject(proj, orig, buffers, settings.afx) : null;
@@ -187,13 +209,11 @@ export async function exportVideo({ media, proj, buffers, overlayMedia = new Map
 
     // 3) 映像
     const frames = Math.max(1, Math.round(dur * fps));
-    const sink = new VideoSampleSink(media.videoTrack);
-    const srcW = media.info.width, srcH = media.info.height;
-    const off = media.firstTimestamp;
-    const lastSrc = off + proj.trimOut - 0.5 / fps;
-    function* times() {
-      for (let i = 0; i < frames; i++) yield Math.min(lastSrc, off + proj.trimIn + (i / fps) * proj.speed + 1e-4);
-    }
+    // クリップごとに、使うフレームの範囲と素材の時刻を決める
+    const runs = clipTimes(proj).map((x, k, all) => {
+      const i0 = Math.round(x.start * fps), i1 = k === all.length - 1 ? frames : Math.round(x.end * fps);
+      return { x, i0, i1 };
+    }).filter((r) => r.i1 > r.i0);
     // 重ねる動画: 使うフレームの時刻を先に全部決めておき、順番に取り出す
     const overlays = proj.overlays || [];
     const active = (ov, t) => t >= ov.start && t < ov.end;
@@ -214,7 +234,17 @@ export async function exportVideo({ media, proj, buffers, overlayMedia = new Map
     }
     const t0 = performance.now();
     let i = 0;
-    for await (const sample of sink.samplesAtTimestamps(times())) {
+    for (const { x, i0, i1 } of runs) {
+     if (signal?.aborted) break;
+     const s = srcs.get(x.clip.srcId).media;
+     const sink = new VideoSampleSink(s.videoTrack);
+     const off = s.firstTimestamp;
+     const lastSrc = off + Math.min(x.clip.out, s.info.duration) - 0.5 / (s.info.fps || fps);
+     const fr = fitRect(proj.frame, s.info.width, s.info.height, x.clip.fit);
+     function* times() {
+       for (let k = i0; k < i1; k++) yield Math.min(lastSrc, off + x.clip.in + (k / fps - x.start) * x.clip.speed + 1e-4);
+     }
+     for await (const sample of sink.samplesAtTimestamps(times())) {
       if (signal?.aborted) { sample?.close(); break; }
       const t = i / fps;
       const cur = new Map();
@@ -229,7 +259,7 @@ export async function exportVideo({ media, proj, buffers, overlayMedia = new Map
         const s = cur.get(ov.id);
         return s ? { w: m.width, h: m.height, draw: (c, x, y, w, h) => s.draw(c, x, y, w, h) } : null;
       };
-      renderFrame(ctx, W, H, proj, t, (c) => { if (sample) sample.draw(c, 0, 0, srcW, srcH); }, { overlaySource });
+      renderFrame(ctx, W, H, proj, t, (c) => { if (sample) sample.draw(c, fr.x, fr.y, fr.w, fr.h); }, { overlaySource });
       sample?.close();
       for (const s of cur.values()) s.close();
       await videoSource.add(t, 1 / fps);
@@ -238,6 +268,7 @@ export async function exportVideo({ media, proj, buffers, overlayMedia = new Map
         const el = (performance.now() - t0) / 1000;
         report('video', i / frames, { eta: (el / i) * (frames - i), frame: i, frames });
       }
+    }
     }
     for (const r of readers.values()) r.return?.();
     if (signal?.aborted) throw new DOMException('canceled', 'AbortError');
@@ -250,10 +281,11 @@ export async function exportVideo({ media, proj, buffers, overlayMedia = new Map
 
   const ext = useAac ? 'mp4' : 'mov';
   const type = useAac ? 'video/mp4' : 'video/quicktime';
-  const base = (media.info.name || 'video').replace(/\.[^.]+$/, '');
+  const first = srcs.get(proj.clips[0].srcId).media;
+  const base = settings.name || (first.info.name || 'video').replace(/\.[^.]+$/, '');
   const stamp = new Date().toTimeString().slice(0, 8).replace(/:/g, '');
   return {
-    file: new File([file.toBlob(type)], `${base}_edit_${stamp}.${ext}`, { type }),
+    file: new File([file.toBlob(type)], settings.name ? `${base}.${ext}` : `${base}_edit_${stamp}.${ext}`, { type }),
     width: W, height: H, fps, codec, audioCodec: mix ? (useAac ? 'aac' : 'pcm') : null,
   };
 }

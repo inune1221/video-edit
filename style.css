@@ -182,3 +182,13 @@ input[type=range] { accent-color: #7a8bff; }
 .clip.overlay .body { background: #1f7a7a; padding-left: 44px; }
 .clip .ov-thumb { position: absolute; left: 0; top: 0; height: 100%; width: 40px; object-fit: cover; opacity: .9; }
 .stage video.ov-el { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; pointer-events: none; }
+
+/* ---- 複数クリップ ---- */
+.clip.video { border-radius: 6px; }
+.clip.video.g-first .body { border-radius: 5px 0 0 5px; }
+.clip.video.g-mid .body { border-radius: 0; }
+.clip.video.g-last .body { border-radius: 0 5px 5px 0; }
+.group-bar { position: absolute; height: 4px; border-radius: 2px; background: linear-gradient(90deg, #4fd1ff, #8a5cff); pointer-events: none; }
+.add-clip { position: absolute; width: 34px; height: 34px; border-radius: 8px; padding: 0; font-size: 20px; line-height: 1; background: #2a2a2e; border: 1px dashed var(--hair); }
+.done-item { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+.done-item .btn { margin-left: auto; padding: 5px 14px; font-size: 13px; }

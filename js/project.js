@@ -1,8 +1,10 @@
 // 編集内容（プロジェクト）のデータ構造と計算。画面・プレビュー・書き出しで共用する。
 //
+// メインの動画は「クリップ」の並び（clips）。各クリップは素材（動画ファイル）の一部分 [in, out) を speed 倍で再生する。
 // 時間は2種類ある:
-//   ソース時間  … 元動画の中の時刻（秒）
-//   タイムライン時間 … 出力動画の中の時刻（秒）。ソース時間 = trimIn + タイムライン時間 × speed
+//   ソース時間  … 素材の中の時刻（秒）
+//   タイムライン時間 … 出力動画の中の時刻（秒）
+// 「かたまり」（group）… 合体させた連続するクリップ。「クリップで分けて書き出し」の単位になる
 
 export const MAX_LONG_SIDE = 3840;
 export const MAX_SHORT_SIDE = 2160;
@@ -10,26 +12,80 @@ export const MAX_SHORT_SIDE = 2160;
 let idSeq = 1;
 export const newId = (p) => `${p}${Date.now().toString(36)}${(idSeq++).toString(36)}`;
 
-export function createProject(src) {
+// frame: 画面（キャンバス）の大きさ。最初の動画に合わせる { width, height, fps }
+export function createProject(frame) {
   return {
-    src, // { name, width, height, duration, fps, hasAudio }
-    trimIn: 0,
-    trimOut: src.duration,
-    speed: 1,
-    keepPitch: true,
+    frame,
+    clips: [],
     origVolume: 1,
     crop: { aspect: 'orig', x: 0, y: 0, w: 1, h: 1 },
     texts: [],
     audios: [],
     effects: [],
     overlays: [], // 重ねる画像・動画
-    afx: null, // 元の動画の音声の補正（EQ・エフェクト）。最初に「音声補正」を開いたときに作る
+    afx: null, // 動画の音声の補正（EQ・エフェクト）。最初に「音声補正」を開いたときに作る
   };
 }
 
-export const timelineDuration = (p) => Math.max(0.05, (p.trimOut - p.trimIn) / p.speed);
-export const toSource = (p, t) => p.trimIn + t * p.speed;
-export const toTimeline = (p, s) => (s - p.trimIn) / p.speed;
+// src: 素材の情報 { id, duration }
+export function newClip(src) {
+  return { id: newId('c'), srcId: src.id, in: 0, out: src.duration, speed: 1, keepPitch: true, volume: 1, fit: 'contain', group: newId('g') };
+}
+
+export const clipLen = (c) => Math.max(0.02, (c.out - c.in) / c.speed);
+
+// 各クリップのタイムライン上の位置
+export function clipTimes(p) {
+  let t = 0;
+  return p.clips.map((clip, index) => { const start = t; t += clipLen(clip); return { clip, index, start, end: t }; });
+}
+export const timelineDuration = (p) => Math.max(0.05, p.clips.reduce((a, c) => a + clipLen(c), 0));
+
+// 時刻 t にあるクリップ
+export function clipAt(p, t) {
+  const ts = clipTimes(p);
+  for (const x of ts) if (t < x.end - 1e-9) return x;
+  return ts[ts.length - 1];
+}
+export const srcTimeAt = (x, t) => x.clip.in + (t - x.start) * x.clip.speed;
+
+// 連続して同じ group のクリップを「かたまり」にまとめる
+export function groupsOf(p) {
+  const out = [];
+  for (const x of clipTimes(p)) {
+    const last = out[out.length - 1];
+    if (last && last.id === x.clip.group) { last.items.push(x); last.end = x.end; }
+    else out.push({ id: x.clip.group, start: x.start, end: x.end, items: [x] });
+  }
+  return out;
+}
+
+// 素材を画面（frame）に収める位置。fit: 'contain'（全体を表示）| 'cover'（画面いっぱい）
+export function fitRect(frame, sw, sh, fit) {
+  const k = fit === 'cover' ? Math.max(frame.width / sw, frame.height / sh) : Math.min(frame.width / sw, frame.height / sh);
+  const w = sw * k, h = sh * k;
+  return { x: (frame.width - w) / 2, y: (frame.height - h) / 2, w, h };
+}
+
+// タイムラインの [gs, ge) の部分だけを取り出したプロジェクト（「クリップで分けて書き出し」用）
+export function subProject(p, g) {
+  const q = JSON.parse(JSON.stringify(p));
+  const gs = g.start, ge = g.end;
+  const ids = new Set(g.items.map((x) => x.clip.id));
+  q.clips = q.clips.filter((c) => ids.has(c.id));
+  const cut = (list, hasOffset) => list.filter((it) => it.end > gs + 1e-6 && it.start < ge - 1e-6).map((it) => {
+    const s = Math.max(it.start, gs);
+    if (hasOffset && it.offset != null) it.offset += s - it.start;
+    it.start = s - gs;
+    it.end = Math.min(it.end, ge) - gs;
+    return it;
+  });
+  q.texts = cut(q.texts);
+  q.effects = cut(q.effects);
+  q.audios = cut(q.audios, true);
+  q.overlays = cut(q.overlays, true);
+  return q;
+}
 
 export const ASPECTS = [
   { key: 'orig', label: '元のまま' },
@@ -44,7 +100,7 @@ export const ASPECTS = [
 
 // 縦横比を変えたとき、できるだけ大きく中央に切り抜く
 export function cropForAspect(p, key) {
-  const { width: sw, height: sh } = p.src;
+  const { width: sw, height: sh } = p.frame;
   const a = ASPECTS.find((x) => x.key === key);
   if (!a || key === 'orig') return { aspect: 'orig', x: 0, y: 0, w: 1, h: 1 };
   if (key === 'free') return { ...p.crop, aspect: 'free' };
@@ -56,7 +112,7 @@ export function cropForAspect(p, key) {
 
 // 切り抜き範囲（ソース動画のピクセル）
 export function cropRect(p) {
-  const { width: sw, height: sh } = p.src;
+  const { width: sw, height: sh } = p.frame;
   const c = p.crop;
   return { x: c.x * sw, y: c.y * sh, w: c.w * sw, h: c.h * sh };
 }
@@ -178,8 +234,8 @@ export function newAudioClip(start, buffer, name, kind = 'music') {
 }
 
 // 保存・元に戻す用に、AudioBuffer などを含まない形で複製する
-export const snapshot = (p) => JSON.stringify({ ...p, src: undefined });
-export const restore = (p, json) => Object.assign(p, JSON.parse(json), { src: p.src });
+export const snapshot = (p) => JSON.stringify(p);
+export const restore = (p, json) => Object.assign(p, JSON.parse(json));
 
 // 重ねる画像・動画。m: 読み込んだ素材の情報 { id, type: 'image'|'video', name, width, height, duration }
 export function newOverlay(start, m, outW, outH) {
