@@ -10,6 +10,10 @@ import { FONTS, fontByKey, addFontCss, ensureFont } from './fonts.js';
 import { decodeAudioFile, computePeaks, resample, SR } from './audio.js';
 import { openVideo, decodeSourceAudio, exportVideo, detectEncoders, bitrateFor } from './media.js';
 import { CanvasSink } from './vendor/mediabunny.min.mjs';
+import { drawMain, TRANSITIONS, MOTIONS } from './compose.js';
+import { COLOR_PRESETS, defaultColor, defaultChroma, applyColorPreset, colorActive, edgeColor } from './gl.js';
+import { resolveKf } from './render.js';
+import { putProject, getProject, listProjects, putFile, getFile, deleteProject, storageInfo, requestPersist } from './store.js';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -50,6 +54,8 @@ const S = {
   media: null, file: null, proj: null, url: null,
   buffers: new Map(), // 音声クリップID -> AudioBuffer
   peaks: new Map(), // 音声クリップID -> Float32Array（10ms ごと）
+  fileReg: new Map(), // 保存用: 'kind:id' -> File（素材のファイル）
+  projId: null, stored: new Set(),
   srcs: new Map(), // 素材 srcId -> { file, url, el(<video>), media, info, thumbs, peaks }
   cur: null, // プレビュー中の素材
   curClip: null, // プレビュー中のクリップ（clipTimes の要素）
@@ -79,12 +85,14 @@ function commit() {
   if (S.history.length > 80) S.history.shift();
   S.hIndex = S.history.length - 1;
   updateUndo();
+  scheduleSave();
 }
 function undoRedo(d) {
   const i = S.hIndex + d;
   if (i < 0 || i >= S.history.length) return;
   S.hIndex = i;
   restore(S.proj, S.history[i]);
+  scheduleSave();
   if (S.sel && !findItem(S.sel.kind, S.sel.id)) S.sel = null;
   if (S.panel) closePanel(true);
   afterTimingChange();
@@ -100,10 +108,11 @@ function updateUndo() {
 // 読み込み（複数の動画をつなげられる）
 
 // 素材（動画ファイル）を1つ読み込む。S.srcs に登録して返す
-async function openSource(file) {
+async function openSource(file, fixedId) {
   const media = await openVideo(file);
   if (!media.canDecodeVideo) toast('この動画の形式は書き出しに対応していない可能性があります', 4000);
-  const id = newId('s');
+  const id = fixedId || newId('s');
+  S.fileReg.set('s:' + id, file);
   const url = URL.createObjectURL(file);
   const el = document.createElement('video');
   el.className = 'src-el';
@@ -146,6 +155,8 @@ function resetProject() {
   S.hIndex = -1;
   S.sel = null;
   S.t = 0;
+  S.fileReg.clear();
+  S.projId = null;
   S.analysis = null;
   S.afxReady = false;
   S.afxGain = 0;
@@ -156,10 +167,10 @@ function resetProject() {
 async function loadFiles(files) {
   files = [...(files || [])];
   if (!files.length) return;
-  if (S.proj && !confirm('今の編集内容を破棄して、新しい動画を開きますか？')) return;
   show('loading');
   const hadProj = !!S.proj;
   try {
+    if (S.proj) await saveNow();
     resetProject();
     S.proj = null;
     const list = [];
@@ -169,6 +180,10 @@ async function loadFiles(files) {
     }
     const f = list[0].info;
     S.proj = createProject({ width: f.width, height: f.height, fps: f.fps });
+    S.projId = newId('p');
+    S.stored = new Set();
+    S.saveSkip = new Set();
+    requestPersist();
     for (const s of list) S.proj.clips.push(newClip(s));
     commit();
     show('editor');
@@ -287,12 +302,50 @@ function layoutPreview() {
   requestDraw();
 }
 
+// トランジション用のもう1本の <video>（つなぎ目で前後のクリップを同時に見せる）
+const auxEl = document.createElement('video');
+auxEl.className = 'src-el';
+auxEl.muted = true;
+auxEl.playsInline = true;
+auxEl.setAttribute('playsinline', '');
+auxEl.preload = 'auto';
+auxEl.addEventListener('seeked', () => requestDraw());
+$('stage').prepend(auxEl);
+let auxSrc = null, auxUsed = false;
+
+function auxFrame(x, st) {
+  const s = S.srcs.get(x.clip.srcId);
+  if (!s) return null;
+  auxUsed = true;
+  if (auxSrc !== s) { auxSrc = s; auxEl.src = s.url; auxEl.currentTime = Math.max(0, st); }
+  const want = clamp(st, 0, s.duration - 0.03);
+  auxEl.playbackRate = x.clip.speed;
+  if (S.playing) {
+    if (auxEl.paused) { auxEl.currentTime = want; auxEl.play().catch(() => {}); }
+    else if (Math.abs(auxEl.currentTime - want) > 0.25) auxEl.currentTime = want;
+  } else {
+    if (!auxEl.paused) auxEl.pause();
+    if (!auxEl.seeking && Math.abs(auxEl.currentTime - want) > 0.03) auxEl.currentTime = want;
+  }
+  if (auxEl.readyState < 2) return null;
+  return { w: s.info.width, h: s.info.height, draw: (c, X, Y, W, H) => c.drawImage(auxEl, X, Y, W, H) };
+}
+
+// プレビュー: 再生中の素材の <video>、トランジション中のもう片方は auxEl から取る
+function previewFrame(x, st) {
+  const s = S.srcs.get(x.clip.srcId);
+  if (s && S.cur === s && S.curClip && S.curClip.clip === x.clip) {
+    if (s.el.readyState < 2) return null;
+    return { w: s.info.width, h: s.info.height, draw: (c, X, Y, W, H) => c.drawImage(s.el, X, Y, W, H) };
+  }
+  return auxFrame(x, st);
+}
+
 // プレビュー中のクリップの映像を、画面（frame）の座標で描く
 function drawSourceFromVideo(c) {
-  const s = S.cur, x = S.curClip;
-  if (!s || !x || s.el.readyState < 2) return;
-  const r = fitRect(S.proj.frame, s.info.width, s.info.height, x.clip.fit);
-  c.drawImage(s.el, r.x, r.y, r.w, r.h);
+  auxUsed = false;
+  drawMain(c, S.proj, S.t, previewFrame);
+  if (!auxUsed && !auxEl.paused) auxEl.pause();
 }
 
 function draw() {
@@ -332,7 +385,7 @@ function draw() {
   if (S.sel && S.sel.kind === 'overlay') {
     const ov = findItem('overlay', S.sel.id), m = ov && S.ovMedia.get(ov.mediaId);
     if (ov && m && S.t >= ov.start && S.t < ov.end) {
-      const b = overlayRect(ov, W, H, m.width, m.height);
+      const b = overlayRect(resolveKf(ov, S.t), W, H, m.width, m.height);
       pctx.save();
       pctx.translate(b.cx, b.cy);
       pctx.rotate(b.rot);
@@ -347,7 +400,7 @@ function draw() {
   if (S.sel && (S.sel.kind === 'text' || S.sel.kind === 'overlay')) {
     const c = S.sel.kind === 'text' && findItem('text', S.sel.id);
     if (c && S.t >= c.start && S.t < c.end) {
-      const b = textBounds(pctx, c, W, H);
+      const b = textBounds(pctx, resolveKf(c, S.t), W, H);
       pctx.save();
       pctx.translate(b.cx, b.cy);
       pctx.rotate(b.rot);
@@ -391,6 +444,10 @@ function showClipAt(t) {
 
 function seek(t, fromScroll = false) {
   S.t = clamp(t, 0, dur());
+  if (S.panel === 'item' && S.sel && (S.sel.kind === 'text' || S.sel.kind === 'overlay')) {
+    const it = findItem(S.sel.kind, S.sel.id);
+    if (it && it.kf && it.kf.length) { applyResolved(it); refreshPanelValues(); }
+  }
   const r = showClipAt(S.t);
   if (r) seekEl(r.s, srcTimeAt(r.x, S.t));
   updateTime();
@@ -545,6 +602,7 @@ function pause() {
   S.playing = false;
   if (S.cur) S.cur.el.pause();
   for (const el of S.ovEls.values()) el.pause();
+  auxEl.pause();
   for (const n of S.audio.nodes) { try { n.stop(); } catch {} }
   S.audio.nodes = [];
   $('playIcon').innerHTML = '<path d="M8 5v14l11-7z"/>';
@@ -603,6 +661,7 @@ function waveCanvas(peaks, from, to, widthPx) {
   return c;
 }
 
+const kfDots = (it) => (it.kf || []).map((k) => h('i', { class: 'kf-dot', style: { left: k.t * S.pps - 4 + 'px' } }));
 const ROW = { ruler: 22, video: 50, effect: 26, overlay: 32, text: 28, audio: 34, gap: 4 };
 
 function renderTimeline() {
@@ -671,6 +730,12 @@ function renderTimeline() {
         if (g.items.length > 1) el.classList.add(gi === 0 ? 'g-first' : gi === g.items.length - 1 ? 'g-last' : 'g-mid');
       });
     }
+    // つなぎ目のトランジションボタン
+    const tsAll = clipTimes(p);
+    for (let i = 0; i < tsAll.length - 1; i++) {
+      const c = tsAll[i].clip, on = c.trans && c.trans.type !== 'none';
+      tlInner.append(h('button', { class: 'trans-btn' + (on ? ' on' : ''), title: 'トランジション', style: { left: pad + tsAll[i].end * S.pps - 12 + 'px', top: y + ROW.video / 2 - 12 + 'px' }, onclick: () => openTrans(c.id) }, on ? '◆' : '⇄'));
+    }
     // 動画を後ろに追加するボタン
     tlInner.append(h('button', { class: 'add-clip', style: { left: pad + total * S.pps + 8 + 'px', top: y + 8 + 'px' }, onclick: () => { $('addVideo').value = ''; $('addVideo').click(); } }, '＋'));
     y += ROW.video + ROW.gap + 4;
@@ -688,8 +753,8 @@ function renderTimeline() {
   };
   lanesFor(p.effects, 'effect', 'effect', ROW.effect, (e) => '✦ ' + EFFECT_TYPES.find((x) => x.key === e.type).label);
   lanesFor(p.overlays, 'overlay', 'overlay', ROW.overlay, (o) => (o.type === 'video' ? '🎞 ' : '🖼 ') + o.name,
-    (o) => { const m = S.ovMedia.get(o.mediaId); return m && m.thumb ? h('img', { class: 'ov-thumb', src: m.thumb }) : null; });
-  lanesFor(p.texts, 'text', 'text', ROW.text, (c) => 'T ' + c.text.replace(/\n/g, ' '));
+    (o) => { const m = S.ovMedia.get(o.mediaId); return [m && m.thumb ? h('img', { class: 'ov-thumb', src: m.thumb }) : null, ...kfDots(o)]; });
+  lanesFor(p.texts, 'text', 'text', ROW.text, (c) => 'T ' + c.text.replace(/\n/g, ' '), (c) => kfDots(c));
   lanesFor(p.audios, 'audio', (a) => (a.kind === 'tts' ? 'tts' : 'audio'), ROW.audio, (a) => (a.kind === 'tts' ? '🗣 ' : '♪ ') + a.name,
     (a, w) => { const pk = S.peaks.get(a.id); return pk ? waveCanvas(pk, a.offset, a.offset + (a.end - a.start), w) : null; });
 
@@ -831,6 +896,7 @@ function renderCtxbar() {
     bar.append(
       h('button', { class: 'btn-accent', onclick: () => openPanel('audio') }, '🎚 音声補正'),
       h('button', { onclick: () => openPanel('speed') }, '速度・クリップ'),
+      h('button', { onclick: () => openPanel('color') }, 'フィルター・動き'),
       h('button', { onclick: () => splitClip(id) }, '分割'),
       ...clipMergeButtons(id),
       h('button', { onclick: () => moveClip(id, -1) }, '← 前へ'),
@@ -984,7 +1050,7 @@ stage.addEventListener('pointerdown', (e) => {
   const active = S.proj.texts.filter((c) => S.t >= c.start && S.t < c.end);
   for (let i = active.length - 1; i >= 0; i--) {
     const c = active[i];
-    const b = textBounds(pctx, c, preview.width, preview.height);
+    const b = textBounds(pctx, resolveKf(c, S.t), preview.width, preview.height);
     const dx = px - b.cx, dy = py - b.cy;
     const lx = dx * Math.cos(-b.rot) - dy * Math.sin(-b.rot), ly = dx * Math.sin(-b.rot) + dy * Math.cos(-b.rot);
     const m = 12 * (preview.width / r.width);
@@ -997,7 +1063,7 @@ stage.addEventListener('pointerdown', (e) => {
     for (let i = ovs.length - 1; i >= 0; i--) {
       const o = ovs[i], m = S.ovMedia.get(o.mediaId);
       if (!m) continue;
-      const b = overlayRect(o, preview.width, preview.height, m.width, m.height);
+      const b = overlayRect(resolveKf(o, S.t), preview.width, preview.height, m.width, m.height);
       const dx = px - b.cx, dy = py - b.cy;
       const lx = dx * Math.cos(-b.rot) - dy * Math.sin(-b.rot), ly = dx * Math.sin(-b.rot) + dy * Math.cos(-b.rot);
       if (Math.abs(lx) <= b.w / 2 && Math.abs(ly) <= b.h / 2) { hit = o; hitKind = 'overlay'; break; }
@@ -1010,6 +1076,7 @@ stage.addEventListener('pointerdown', (e) => {
       if (S.panel && S.panel !== 'item') closePanel(true);
       if (S.panel === 'item') openItemPanel(hitKind, hit.id); else renderTimeline();
     }
+    applyResolved(hit);
     stageDrag = { type: hitKind, target: hit, x: e.clientX, y: e.clientY, o: { x: hit.x, y: hit.y }, r, moved: false, wasSel };
     requestDraw();
   } else {
@@ -1027,6 +1094,7 @@ stage.addEventListener('pointermove', (e) => {
     d.moved = true;
     if (d.type === 'text') d.target.size = clamp(d.pinch.size * k, 0.015, 0.6);
     else if (d.type === 'overlay') d.target.scale = clamp(d.pinch.scale * k, 0.03, 3);
+    if (d.type === 'text' || d.type === 'overlay') syncKf(d.target);
     else if (d.type === 'crop') scaleCrop(d.pinch.crop, 1 / k);
     requestDraw();
     return;
@@ -1040,6 +1108,7 @@ stage.addEventListener('pointermove', (e) => {
     if (S.guideX) x = 0.5;
     d.target.x = clamp(x, -0.2, 1.2);
     d.target.y = clamp(d.o.y + dy / d.r.height, -0.2, 1.2);
+    syncKf(d.target);
     requestDraw();
   } else if (d.type === 'crop') {
     const c = S.proj.crop;
@@ -1097,8 +1166,8 @@ function openPanel(name, title) {
   const body = $('panelBody');
   body.innerHTML = '';
   body.scrollTop = 0;
-  const builders = { speed: buildSpeed, volume: buildVolume, crop: buildCrop, tts: buildTts, effectPick: buildEffectPick, audio: buildAudioFx };
-  const titles = { speed: '速度', volume: '音量バランス', crop: '切り抜き', tts: '読み上げ', effectPick: 'エフェクトを追加', audio: '音声補正' };
+  const builders = { speed: buildSpeed, volume: buildVolume, crop: buildCrop, tts: buildTts, effectPick: buildEffectPick, audio: buildAudioFx, color: buildColorPanel, trans: buildTransPanel };
+  const titles = { speed: '速度', volume: '音量バランス', crop: '切り抜き', tts: '読み上げ', effectPick: 'エフェクトを追加', audio: '音声補正', color: 'フィルター・動き', trans: 'トランジション' };
   $('panelTitle').textContent = title || titles[name] || '';
   if (builders[name]) builders[name](body);
   if (wasCrop !== cropMode()) layoutPreview();
@@ -1107,18 +1176,26 @@ function openPanel(name, title) {
 }
 
 function openItemPanel(kind, id) {
+  S.onItemEdit = null;
   if (kind === 'video') { S.sel = { kind, id }; openPanel('speed'); return; }
   S.sel = { kind, id };
   openPanel('item', { text: 'テキスト', effect: 'エフェクト', overlay: '重ねる素材', audio: '音声' }[kind]);
   const body = $('panelBody');
   const it = findItem(kind, id);
+  if (kind === 'text' || kind === 'overlay') { applyResolved(it); S.onItemEdit = () => syncKf(it); }
   if (kind === 'text') buildText(body, it);
   else if (kind === 'effect') buildEffect(body, it);
   else if (kind === 'overlay') buildOverlay(body, it);
+  if (kind === 'text' || kind === 'overlay') {
+    // キーフレームは削除ボタンの前に入れる
+    const last = body.lastElementChild;
+    body.insertBefore(kfSection(it), last);
+  }
   else buildAudio(body, it);
 }
 
 function closePanel(silent) {
+  S.onItemEdit = null;
   const wasCrop = cropMode();
   const wasAudio = S.panel === 'audio';
   S.panel = null;
@@ -1141,7 +1218,7 @@ function slider({ label, min, max, step, get, set, show, onChange }) {
   const input = h('input', { type: 'range', min, max, step });
   const out = h('output');
   const refresh = () => { input.value = get(); out.textContent = show ? show(+input.value) : input.value; };
-  input.addEventListener('input', () => { set(+input.value); out.textContent = show ? show(+input.value) : input.value; requestDraw(); });
+  input.addEventListener('input', () => { set(+input.value); out.textContent = show ? show(+input.value) : input.value; S.onItemEdit && S.onItemEdit(); requestDraw(); });
   input.addEventListener('change', () => { commit(); onChange && onChange(); });
   refresh();
   refreshers.push(refresh);
@@ -1370,6 +1447,8 @@ async function addAudioFile(file, kind = 'music', label) {
     const start = clamp(S.t, 0, Math.max(0, dur() - 0.1));
     const name = label || file.name.replace(/\.[^.]+$/, '');
     const a = newAudioClip(start, buf, name, kind);
+    a.fileKey = newId('f');
+    S.fileReg.set('a:' + a.fileKey, file);
     if (kind === 'music') a.end = Math.min(a.end, Math.max(start + 0.1, dur()));
     S.buffers.set(a.id, buf);
     const chs = Array.from({ length: buf.numberOfChannels }, (_, i) => buf.getChannelData(i));
@@ -2032,12 +2111,11 @@ function syncOverlayVideos() {
   for (const [id, el] of S.ovEls) if (!ids.has(id)) { el.pause(); el.remove(); S.ovEls.delete(id); }
 }
 
-async function addOverlayFile(file) {
-  if (!file) return;
-  const isVideo = file.type.startsWith('video/') || /\.(mov|mp4|m4v|webm)$/i.test(file.name);
-  toast(isVideo ? '動画を読み込み中…' : '画像を読み込み中…', 20000);
-  try {
-    const id = newId('m');
+// 重ねる素材を読み込んで S.ovMedia に登録する
+async function loadOverlayMedia(file, fixedId, type) {
+    const isVideo = type ? type === 'video' : file.type.startsWith('video/') || /\.(mov|mp4|m4v|webm)$/i.test(file.name);
+    const id = fixedId || newId('m');
+    S.fileReg.set('o:' + id, file);
     const m = { id, type: isVideo ? 'video' : 'image', name: file.name.replace(/\.[^.]+$/, ''), file };
     const th = h('canvas');
     if (isVideo) {
@@ -2070,6 +2148,15 @@ async function addOverlayFile(file) {
       m.thumb = th.toDataURL('image/jpeg', 0.7);
     }
     S.ovMedia.set(id, m);
+    return m;
+}
+
+async function addOverlayFile(file) {
+  if (!file) return;
+  const isVideo = file.type.startsWith('video/') || /\.(mov|mp4|m4v|webm)$/i.test(file.name);
+  toast(isVideo ? '動画を読み込み中…' : '画像を読み込み中…', 20000);
+  try {
+    const m = await loadOverlayMedia(file);
     const o = outputSize(S.proj);
     const ov = newOverlay(clamp(S.t, 0, Math.max(0, dur() - 0.1)), m, o.w, o.h);
     if (!isVideo) ov.end = Math.min(ov.end, Math.max(ov.start + 0.5, dur()));
@@ -2121,10 +2208,344 @@ function buildOverlay(body, ov) {
         ? slider({ label: '音量', min: 0, max: 2, step: 0.01, get: () => ov.volume, set: (v) => (ov.volume = v), show: (v) => Math.round(v * 100) + '%' })
         : h('p', { class: 'lbl' }, 'この動画には音声がありません')));
   }
+  body.append(chromaSection(ov));
+  body.append(colorSection(ov, '色調補正・フィルター'));
   body.append(timingButtons(ov));
   body.append(h('div', { class: 'btn-row' },
     h('button', { onclick: () => duplicateItem('overlay', ov.id) }, '複製'),
     h('button', { class: 'danger', style: { color: 'var(--danger)' }, onclick: () => deleteItem('overlay', ov.id) }, '削除')));
+}
+
+// ---------------------------------------------------------------------------
+// トランジション・色調補正・ズームパン・グリーンバック・キーフレーム
+
+// --- キーフレーム ---
+const KF_OF = { text: ['x', 'y', 'size', 'rot'], overlay: ['x', 'y', 'scale', 'rot', 'opacity'] };
+const kindOf = (it) => (S.proj.texts.includes(it) ? 'text' : 'overlay');
+// キーフレームがあるときは、再生位置の値を編集用の値に写す
+function applyResolved(it) {
+  if (!it || !it.kf || !it.kf.length) return;
+  const r = resolveKf(it, S.t);
+  for (const k of KF_OF[kindOf(it)]) it[k] = r[k];
+}
+// 値を変えたら、再生位置のキーフレームを追加・更新する
+function syncKf(it) {
+  if (!it || !it.kf || !it.kf.length) return;
+  const lt = clamp(S.t - it.start, 0, it.end - it.start);
+  let k = it.kf.find((x) => Math.abs(x.t - lt) < 0.04);
+  if (!k) { k = { t: lt }; it.kf.push(k); it.kf.sort((a, b) => a.t - b.t); }
+  for (const p of KF_OF[kindOf(it)]) k[p] = it[p];
+}
+function kfSection(it) {
+  const kind = kindOf(it);
+  const list = h('div', { class: 'chips scroll' });
+  const refresh = () => {
+    list.innerHTML = '';
+    for (const k of it.kf || []) list.append(h('button', { class: 'chip' + (Math.abs(S.t - it.start - k.t) < 0.04 ? ' on' : ''), onclick: () => seek(it.start + k.t) }, '◆ ' + k.t.toFixed(1) + 's'));
+    if (!it.kf || !it.kf.length) list.append(h('span', { class: 'lbl' }, 'キーフレームなし'));
+  };
+  refreshers.push(refresh);
+  refresh();
+  const add = () => {
+    if (S.t < it.start || S.t > it.end) { toast('再生位置をこの素材の表示時間の中に合わせてください'); return; }
+    if (!it.kf) it.kf = [];
+    const lt = clamp(S.t - it.start, 0, it.end - it.start);
+    let k = it.kf.find((x) => Math.abs(x.t - lt) < 0.04);
+    if (!k) { k = { t: lt }; it.kf.push(k); it.kf.sort((a, b) => a.t - b.t); }
+    for (const p of KF_OF[kind]) k[p] = it[p];
+    commit(); refreshPanelValues(); renderTimeline(); requestDraw();
+    if (it.kf.length === 1) toast('もう1つ別の時間にキーフレームを置くと、その間を動きます', 3500);
+  };
+  const del = () => {
+    if (!it.kf) return;
+    const lt = S.t - it.start;
+    const i = it.kf.findIndex((x) => Math.abs(x.t - lt) < 0.04);
+    if (i < 0) { toast('再生位置にキーフレームがありません'); return; }
+    it.kf.splice(i, 1);
+    commit(); refreshPanelValues(); renderTimeline(); requestDraw();
+  };
+  const preset = (fn) => () => {
+    const len = it.end - it.start;
+    const base = {};
+    for (const p of KF_OF[kind]) base[p] = it[p];
+    const a = { t: 0, ...base }, b = { t: len, ...base };
+    fn(a, b);
+    it.kf = [a, b];
+    commit(); refreshPanelValues(); renderTimeline(); seek(it.start); requestDraw();
+  };
+  const sz = kind === 'text' ? 'size' : 'scale';
+  return sec('キーフレーム（動き）', list,
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn-accent', onclick: add }, '◆ 再生位置に追加'),
+      h('button', { onclick: del }, '再生位置のを削除'),
+      h('button', { onclick: () => { it.kf = []; commit(); refreshPanelValues(); renderTimeline(); requestDraw(); } }, '全部削除')),
+    h('div', { class: 'sec-title' }, 'かんたん動き（ケン・バーンズ）'),
+    h('div', { class: 'btn-row' },
+      h('button', { onclick: preset((a, b) => { b[sz] = a[sz] * 1.25; }) }, 'ズームイン'),
+      h('button', { onclick: preset((a, b) => { a[sz] = b[sz] * 1.25; }) }, 'ズームアウト'),
+      h('button', { onclick: preset((a, b) => { a.x -= 0.15; b.x += 0.15; }) }, '左→右'),
+      h('button', { onclick: preset((a, b) => { a.y += 0.12; b.y -= 0.12; }) }, '下→上')),
+    h('p', { class: 'lbl' }, '別々の時間にキーフレームを置くと、その間をなめらかに動きます。キーフレームがあるときに位置や大きさを変えると、再生位置のキーフレームが自動で追加・更新されます。'));
+}
+
+// --- 色調補正 ---
+function colorSection(obj, title, onAll) {
+  if (!obj.color) obj.color = defaultColor();
+  const c = obj.color;
+  const pre = (fn) => (v) => { fn(v); c.preset = ''; };
+  return sec(title,
+    chips({ scroll: true, options: COLOR_PRESETS.map((p) => ({ v: p.key, label: p.label })), get: () => c.preset, set: (k) => { applyColorPreset(c, k); refreshPanelValues(); } }),
+    slider({ label: '明るさ', min: -1, max: 1, step: 0.01, get: () => c.bright, set: pre((v) => (c.bright = v)), show: (v) => Math.round(v * 100) + '' }),
+    slider({ label: 'コントラスト', min: 0.5, max: 1.6, step: 0.01, get: () => c.contrast, set: pre((v) => (c.contrast = v)), show: (v) => Math.round(v * 100) + '' }),
+    slider({ label: '彩度', min: 0, max: 2, step: 0.01, get: () => c.sat, set: pre((v) => (c.sat = v)), show: (v) => Math.round(v * 100) + '' }),
+    slider({ label: '色温度', min: -1, max: 1, step: 0.01, get: () => c.temp, set: pre((v) => (c.temp = v)), show: (v) => (v > 0 ? '暖' : v < 0 ? '寒' : '') + Math.round(Math.abs(v) * 100) }),
+    slider({ label: '色かぶり', min: -1, max: 1, step: 0.01, get: () => c.tint, set: pre((v) => (c.tint = v)), show: (v) => Math.round(v * 100) + '' }),
+    slider({ label: '周辺減光', min: 0, max: 1, step: 0.01, get: () => c.vig, set: pre((v) => (c.vig = v)), show: (v) => Math.round(v * 100) + '' }),
+    slider({ label: 'フェード', min: 0, max: 0.6, step: 0.01, get: () => c.fade, set: pre((v) => (c.fade = v)), show: (v) => Math.round(v * 100) + '' }),
+    h('div', { class: 'btn-row' },
+      h('button', { onclick: () => { Object.assign(c, defaultColor()); commit(); refreshPanelValues(); requestDraw(); } }, 'リセット'),
+      onAll ? h('button', { onclick: onAll }, 'すべてのクリップに使う') : null));
+}
+
+function buildColorPanel(body) {
+  const c = targetClip();
+  const n = clipIndex(c.id) + 1;
+  $('panelTitle').textContent = S.proj.clips.length > 1 ? `フィルター・動き（クリップ ${n}）` : 'フィルター・動き';
+  body.append(colorSection(c, '色調補正・フィルター', () => {
+    for (const x of S.proj.clips) x.color = { ...c.color };
+    commit(); requestDraw(); toast('すべてのクリップに同じ色を使いました');
+  }));
+  if (!c.motion) c.motion = { type: 'none', amount: 0.15 };
+  body.append(sec('ズームパン（ケン・バーンズ）',
+    chips({ options: MOTIONS.map((m) => ({ v: m.key, label: m.label })), get: () => c.motion.type, set: (v) => (c.motion.type = v) }),
+    slider({ label: '動きの大きさ', min: 0.05, max: 0.6, step: 0.01, get: () => c.motion.amount, set: (v) => (c.motion.amount = v), show: (v) => Math.round(v * 100) + '%' }),
+    h('p', { class: 'lbl' }, 'クリップの最初から最後にかけて、ゆっくり拡大・移動します。')));
+  body.append(h('p', { class: 'lbl' }, 'タイムラインで別のクリップを選ぶと、そのクリップを調整できます。'));
+}
+
+// --- トランジション ---
+function buildTransPanel(body) {
+  const c = findItem('video', S.transClip);
+  if (!c) { body.append(h('p', { class: 'lbl' }, 'つなぎ目が見つかりません')); return; }
+  if (!c.trans) c.trans = { type: 'none', dur: 0.8 };
+  const tr = c.trans;
+  const i = clipIndex(c.id);
+  $('panelTitle').textContent = `つなぎ目 ${i + 1} → ${i + 2}`;
+  const playIt = () => { const x = clipTimes(S.proj)[i]; pause(); seek(Math.max(0, x.end - tr.dur / 2 - 0.6)); play(); };
+  body.append(sec('トランジション',
+    chips({ options: TRANSITIONS.map((t) => ({ v: t.key, label: t.label })), get: () => tr.type, set: (v) => { tr.type = v; renderTimeline(); } }),
+    slider({ label: '長さ', min: 0.2, max: 2.5, step: 0.05, get: () => tr.dur, set: (v) => (tr.dur = v), show: (v) => v.toFixed(2) + '秒' }),
+    h('div', { class: 'btn-row' },
+      h('button', { onclick: playIt }, '▶ ここを再生'),
+      h('button', { onclick: () => { for (const x of S.proj.clips.slice(0, -1)) x.trans = { ...tr }; commit(); renderTimeline(); toast('すべてのつなぎ目に使いました'); } }, 'すべてのつなぎ目に使う')),
+    h('p', { class: 'lbl' }, 'つなぎ目をはさんで前後のクリップが少しずつ重なって切り替わります（全体の長さは変わりません）。')));
+}
+function openTrans(clipId) { S.transClip = clipId; openPanel('trans'); }
+
+// --- グリーンバック合成（重ねる素材） ---
+function chromaSection(ov) {
+  if (!ov.chroma) ov.chroma = defaultChroma();
+  const k = ov.chroma;
+  const detail = h('div', {},
+    h('div', { class: 'sec-title' }, '抜く色'),
+    h('div', { class: 'btn-row' },
+      h('button', { onclick: () => { k.color = '#00ff00'; commit(); refreshPanelValues(); requestDraw(); } }, '緑'),
+      h('button', { onclick: () => { k.color = '#0047ff'; commit(); refreshPanelValues(); requestDraw(); } }, '青'),
+      h('button', { onclick: () => autoKey(ov) }, '自動（ふちの色）')),
+    colors({ get: () => k.color, set: (v) => (k.color = v) }),
+    slider({ label: '抜く範囲', min: 0.01, max: 0.4, step: 0.005, get: () => k.sim, set: (v) => (k.sim = v), show: (v) => Math.round(v * 100) + '' }),
+    slider({ label: 'なめらかさ', min: 0.005, max: 0.3, step: 0.005, get: () => k.smooth, set: (v) => (k.smooth = v), show: (v) => Math.round(v * 100) + '' }),
+    slider({ label: '色かぶり除去', min: 0, max: 0.4, step: 0.01, get: () => k.spill, set: (v) => (k.spill = v), show: (v) => Math.round(v * 100) + '' }));
+  refreshers.push(() => (detail.hidden = !k.on));
+  detail.hidden = !k.on;
+  return sec('グリーンバック合成',
+    toggle({ label: '背景の色を透明にする', get: () => k.on, set: (v) => { k.on = v; if (v && k.auto !== false) autoKey(ov, true); refreshPanelValues(); } }),
+    detail,
+    h('p', { class: 'lbl' }, '緑や青の背景で撮った動画・画像の背景を消して、人物などだけを重ねます。'));
+}
+function autoKey(ov, quiet) {
+  const src = previewOverlaySource(ov);
+  if (!src) { if (!quiet) toast('素材の映像がまだ読み込まれていません'); return; }
+  ov.chroma.color = edgeColor((g, w, h2) => src.draw(g, 0, 0, w, h2), src.w, src.h);
+  ov.chroma.auto = false;
+  commit(); refreshPanelValues(); requestDraw();
+}
+
+// ---------------------------------------------------------------------------
+// 編集内容の保存と再開（端末内に自動保存）
+
+let saveTimer = 0, saving = false, saveAgain = false, quotaWarned = false;
+function scheduleSave(delay = 1500) {
+  if (!S.proj || !S.projId) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveNow, delay);
+}
+function usedKeys() {
+  const p = S.proj, keys = new Set();
+  for (const c of p.clips) keys.add('s:' + c.srcId);
+  for (const o of p.overlays) keys.add('o:' + o.mediaId);
+  for (const a of p.audios) if (a.fileKey) keys.add('a:' + a.fileKey);
+  return [...keys];
+}
+function smallThumb() {
+  try {
+    const c = document.createElement('canvas');
+    const k = 200 / Math.max(preview.width, preview.height);
+    c.width = Math.max(1, Math.round(preview.width * k)); c.height = Math.max(1, Math.round(preview.height * k));
+    c.getContext('2d').drawImage(preview, 0, 0, c.width, c.height);
+    return c.toDataURL('image/jpeg', 0.6);
+  } catch { return null; }
+}
+async function saveNow() {
+  if (!S.proj || !S.projId) return;
+  if (saving) { saveAgain = true; return; }
+  saving = true;
+  try {
+    const id = S.projId;
+    const keys = usedKeys();
+    const meta = keys.map((k) => { const f = S.fileReg.get(k); return { key: k, name: f ? f.name : '', size: f ? f.size : 0, type: f ? f.type : '' }; });
+    const ovTypes = Object.fromEntries([...S.ovMedia.values()].map((m) => [m.id, m.type]));
+    const first = S.srcs.get(S.proj.clips[0].srcId);
+    const old = await getProject(id);
+    await putProject({
+      id, name: (first ? first.info.name : '動画').replace(/\.[^.]+$/, ''), created: old ? old.created : Date.now(), updated: Date.now(),
+      thumb: smallThumb() || (old && old.thumb), duration: dur(), json: snapshot(S.proj), files: meta, ovTypes,
+    });
+    // 素材ファイル（まだ保存していないものだけ）
+    for (const k of keys) {
+      if (S.stored.has(k) || S.saveSkip?.has(k)) continue;
+      const f = S.fileReg.get(k);
+      if (!f) continue;
+      try {
+        await putFile(id + '/' + k, f);
+        S.stored.add(k);
+      } catch (e) {
+        console.warn('save file', e);
+        (S.saveSkip ||= new Set()).add(k);
+        if (!quotaWarned) { quotaWarned = true; toast('空き容量が足りず、一部の素材ファイルは保存できませんでした。続きを開くときに選び直してください', 5000); }
+      }
+    }
+  } catch (e) {
+    console.warn('save', e);
+  } finally {
+    saving = false;
+    if (saveAgain) { saveAgain = false; scheduleSave(500); }
+  }
+}
+
+async function renderSavedList() {
+  const box = $('savedList');
+  if (!box) return;
+  $('backToEdit').hidden = !S.proj;
+  let list = [];
+  try { list = await listProjects(); } catch { }
+  box.innerHTML = '';
+  box.hidden = !list.length;
+  if (!list.length) return;
+  box.append(h('div', { class: 'sec-title' }, '続きから編集'));
+  for (const r of list) {
+    const d = new Date(r.updated);
+    box.append(h('div', { class: 'saved-item' },
+      r.thumb ? h('img', { src: r.thumb }) : h('div', { class: 'ph' }),
+      h('div', { class: 'saved-info', onclick: () => openSaved(r.id) },
+        h('div', {}, r.name),
+        h('div', { class: 'lbl' }, `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}・${fmt(r.duration || 0)}`)),
+      h('button', { class: 'chip', onclick: () => openSaved(r.id) }, '開く'),
+      h('button', { class: 'chip danger', onclick: async () => { if (!confirm(`「${r.name}」の保存データを削除しますか？`)) return; await deleteProject(r.id); renderSavedList(); } }, '削除')));
+  }
+  const info = await storageInfo();
+  if (info && info.usage) box.append(h('p', { class: 'lbl' }, `保存データの使用量: 約${(info.usage / 1e9).toFixed(2)}GB` + (info.quota ? `（上限の目安 ${(info.quota / 1e9).toFixed(0)}GB）` : '')));
+}
+
+// 足りない素材を選び直してもらう（タップの中でファイル選択を開く必要がある）
+function askFiles(names) {
+  return new Promise((resolve) => {
+    const input = h('input', { type: 'file', multiple: true, hidden: true });
+    const sheet = h('div', { class: 'sheet' }, h('div', { class: 'sheet-card' },
+      h('div', { class: 'sheet-title' }, '素材ファイルを選び直してください'),
+      h('p', { class: 'lbl' }, '保存されていない素材があります。次のファイルをまとめて選んでください:'),
+      h('ul', { class: 'lbl' }, ...names.map((n) => h('li', {}, n))),
+      h('button', { class: 'primary', onclick: () => input.click() }, 'ファイルを選ぶ'),
+      h('button', { class: 'wide', onclick: () => { sheet.remove(); resolve([]); } }, 'キャンセル'),
+      input));
+    input.addEventListener('change', () => { sheet.remove(); resolve([...input.files]); });
+    document.body.append(sheet);
+  });
+}
+
+async function openSaved(id) {
+  show('loading');
+  $('loadMsg').textContent = '保存した編集を開いています…';
+  try {
+    if (S.proj) await saveNow();
+    const rec = await getProject(id);
+    resetProject();
+    S.proj = null;
+    const proj = JSON.parse(rec.json);
+    const files = new Map();
+    const missing = [];
+    for (const m of rec.files) {
+      const f = await getFile(id + '/' + m.key);
+      if (f) files.set(m.key, f instanceof File ? f : new File([f], m.name, { type: m.type }));
+      else missing.push(m);
+    }
+    if (missing.length) {
+      show('start');
+      const picked = await askFiles(missing.map((m) => m.name));
+      show('loading');
+      for (const m of missing) {
+        const f = picked.find((x) => x.name === m.name && x.size === m.size) || picked.find((x) => x.name === m.name);
+        if (f) files.set(m.key, f);
+      }
+      const still = missing.filter((m) => !files.has(m.key));
+      if (still.some((m) => m.key.startsWith('s:'))) throw new Error('動画ファイルが見つかりません: ' + still.map((m) => m.name).join(', '));
+    }
+    // メインの動画
+    const srcIds = [...new Set(proj.clips.map((c) => c.srcId))];
+    for (let i = 0; i < srcIds.length; i++) {
+      $('loadMsg').textContent = `動画を読み込み中…（${i + 1}/${srcIds.length}）`;
+      await openSource(files.get('s:' + srcIds[i]), srcIds[i]);
+    }
+    // 重ねる素材
+    for (const mid of new Set(proj.overlays.map((o) => o.mediaId))) {
+      const f = files.get('o:' + mid);
+      if (f) await loadOverlayMedia(f, mid, rec.ovTypes ? rec.ovTypes[mid] : undefined);
+    }
+    proj.overlays = proj.overlays.filter((o) => S.ovMedia.has(o.mediaId));
+    // 音声
+    const bufs = new Map();
+    for (const a of proj.audios) {
+      const f = a.fileKey && files.get('a:' + a.fileKey);
+      if (!f) continue;
+      if (!bufs.has(a.fileKey)) { bufs.set(a.fileKey, await decodeAudioFile(f)); S.fileReg.set('a:' + a.fileKey, f); }
+      const buf = bufs.get(a.fileKey);
+      S.buffers.set(a.id, buf);
+      const chs = Array.from({ length: buf.numberOfChannels }, (_, i) => buf.getChannelData(i));
+      S.peaks.set(a.id, computePeaks(chs, Math.ceil(buf.duration * 100)));
+    }
+    proj.audios = proj.audios.filter((a) => S.buffers.has(a.id));
+    S.proj = proj;
+    S.projId = id;
+    S.stored = new Set([...files.keys()].filter((k) => !missing.some((m) => m.key === k)));
+    commit();
+    show('editor');
+    closePanel(true);
+    fitZoom();
+    layoutPreview();
+    afterTimingChange();
+    seek(0);
+    startAfxWorker();
+    for (const s of S.srcs.values()) { loadThumbs(s); loadSourceWave(s); }
+    afxChanged(false);
+    toast('保存した編集を開きました');
+  } catch (e) {
+    console.error(e);
+    alert('開けませんでした: ' + (e.message || e));
+    resetProject();
+    S.proj = null;
+    show('start');
+    renderSavedList();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2137,6 +2558,7 @@ $('tools').addEventListener('click', (e) => {
   if (tool === 'text') addText();
   else if (tool === 'music') { $('audioFile').value = ''; $('audioFile').click(); }
   else if (tool === 'overlay') { $('ovFile').value = ''; $('ovFile').click(); }
+  else if (tool === 'color') openPanel('color');
   else if (tool === 'addvideo') { $('addVideo').value = ''; $('addVideo').click(); }
   else if (tool === 'effect') openPanel('effectPick');
   else openPanel(tool);
@@ -2177,8 +2599,10 @@ async function openExport() {
   const est = () => {
     const s = outputSize(p, EXP.limit);
     const br = bitrateFor(s.w, s.h, EXP.fps, EXP.codec, EXP.quality);
+    const hi = bitrateFor(s.w, s.h, EXP.fps, EXP.codec, 'high'), mx = bitrateFor(s.w, s.h, EXP.fps, EXP.codec, 'max');
     const mb = ((br + 256000) * dur()) / 8 / 1e6;
-    $('expEstimate').textContent = `${s.w}×${s.h}・${+EXP.fps.toFixed(2)}fps・約${Math.round(br / 1e6)}Mbps・予想サイズ 約${mb < 10 ? mb.toFixed(1) : Math.round(mb)}MB（${fmt(dur())}）`;
+    $('expEstimate').textContent = `${s.w}×${s.h}・${+EXP.fps.toFixed(2)}fps・約${Math.round(br / 1e6)}Mbps・予想サイズ 約${mb < 10 ? mb.toFixed(1) : Math.round(mb)}MB（${fmt(dur())}）`
+      + `\n画質の違いはビットレート（1秒あたりのデータ量）だけです。高画質＝iPhoneのカメラと同じくらい（約${Math.round(hi / 1e6)}Mbps）、最高画質＝その約1.6倍（約${Math.round(mx / 1e6)}Mbps）。細かい模様や動きの激しい場面で差が出ます。`;
   };
   box.append(
     h('div', { class: 'sec-title' }, '解像度'), chips({ options: resOpts, get: () => EXP.limit, set: (v) => (EXP.limit = v), onChange: est }),
@@ -2300,13 +2724,16 @@ $('share').addEventListener('click', async () => {
 // 起動
 
 $('file').addEventListener('change', (e) => { loadFiles(e.target.files); e.target.value = ''; });
-$('file2').addEventListener('change', (e) => { loadFiles(e.target.files); e.target.value = ''; });
+$('homeBtn').addEventListener('click', async () => { pause(); await saveNow(); show('start'); $('backToEdit').hidden = false; renderSavedList(); });
+$('backToEdit').addEventListener('click', () => { show('editor'); layoutPreview(); renderTimeline(); scrollToTime(); });
 $('addVideo').addEventListener('change', (e) => { addVideos(e.target.files); e.target.value = ''; });
 $('undo').addEventListener('click', () => undoRedo(-1));
 $('redo').addEventListener('click', () => undoRedo(1));
 window.addEventListener('resize', () => { if (S.proj) { layoutPreview(); renderTimeline(); scrollToTime(); } });
 document.addEventListener('visibilitychange', () => { if (document.hidden) pause(); });
 addFontCss();
+renderSavedList();
+document.addEventListener('visibilitychange', () => { if (document.hidden) saveNow(); });
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 
 // テスト用

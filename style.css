@@ -192,3 +192,18 @@ input[type=range] { accent-color: #7a8bff; }
 .add-clip { position: absolute; width: 34px; height: 34px; border-radius: 8px; padding: 0; font-size: 20px; line-height: 1; background: #2a2a2e; border: 1px dashed var(--hair); }
 .done-item { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
 .done-item .btn { margin-left: auto; padding: 5px 14px; font-size: 13px; }
+
+/* ---- トランジション・キーフレーム ---- */
+.trans-btn { position: absolute; width: 24px; height: 24px; padding: 0; border-radius: 6px; font-size: 12px; line-height: 1; z-index: 6;
+  background: #1c1c1e; border: 1px solid rgba(255,255,255,.35); color: #fff; }
+.trans-btn.on { background: linear-gradient(135deg, #3a7bff, #8a5cff); border-color: #fff; }
+.kf-dot { position: absolute; bottom: 2px; width: 8px; height: 8px; background: #ffd60a; transform: rotate(45deg); z-index: 2; box-shadow: 0 0 2px #000; }
+#expEstimate { white-space: pre-line; }
+
+/* ---- 保存した編集 ---- */
+.saved { margin-top: 16px; }
+.saved-item { display: flex; align-items: center; gap: 10px; padding: 8px; margin: 6px 0; background: var(--card2); border-radius: 12px; }
+.saved-item img, .saved-item .ph { width: 64px; height: 40px; object-fit: cover; border-radius: 6px; background: #000; flex: none; }
+.saved-info { flex: 1; min-width: 0; font-size: 14px; }
+.saved-info > div:first-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chip.danger { color: var(--danger); }

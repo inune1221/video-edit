@@ -21,7 +21,7 @@
 
   <!-- 最初の画面 -->
   <section id="start" class="screen">
-    <header class="bar"><h1>動画編集</h1></header>
+    <header class="bar"><h1>動画編集</h1><button class="pill" id="backToEdit" hidden>編集に戻る ›</button></header>
     <label class="pick">
       <input type="file" id="file" accept="video/*,.mov,.mp4,.m4v" multiple hidden>
       <span class="pick-icon" aria-hidden="true">
@@ -30,10 +30,11 @@
       <span class="pick-title">動画を選ぶ</span>
       <span class="muted">4K / フルHD に対応・書き出し無制限<br>複数選ぶと順番につなげます</span>
     </label>
+    <div id="savedList" class="saved" hidden></div>
     <div class="note">
       <p><b>画質を落とさないコツ</b></p>
       <p>「写真ライブラリ」から選ぶと、iPhoneが動画を変換（圧縮）することがあります。確実にオリジナルを使うには、写真Appで動画を開いて <b>共有 →「"ファイル"に保存」</b> し、ここで <b>ブラウズ</b> から選んでください。</p>
-      <p class="muted">動画はこのiPhoneの中だけで処理され、どこにもアップロードされません。AIも使いません。</p>
+      <p class="muted">動画はこのiPhoneの中だけで処理され、どこにもアップロードされません。AIも使いません。編集内容は自動でこのiPhoneに保存され、上の「続きから編集」から再開できます。</p>
     </div>
     <div class="note">
       <p><b>目安</b></p>
@@ -52,10 +53,9 @@
   <!-- 編集画面 -->
   <section id="editor" hidden>
     <header class="ebar">
-      <label class="icon-btn" aria-label="別の動画を開く">
-        <input type="file" id="file2" accept="video/*,.mov,.mp4,.m4v" multiple hidden>
+      <button class="icon-btn" id="homeBtn" aria-label="ホーム（新しい動画・保存した編集）">
         <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
-      </label>
+      </button>
       <button class="icon-btn" id="undo" aria-label="元に戻す"><svg viewBox="0 0 24 24"><path d="M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg></button>
       <button class="icon-btn" id="redo" aria-label="やり直す"><svg viewBox="0 0 24 24"><path d="m15 14 5-5-5-5M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg></button>
       <span class="ebar-info" id="resInfo"></span>
@@ -87,6 +87,7 @@
         <button data-tool="tts"><svg viewBox="0 0 24 24"><path d="M4 10v4M8 7v10M12 4v16M16 8v8M20 11v2"/></svg>読み上げ</button>
         <button data-tool="music"><svg viewBox="0 0 24 24"><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg>音楽</button>
         <button data-tool="overlay"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="13" height="13" rx="2"/><rect x="8" y="8" width="13" height="13" rx="2"/></svg>重ねる</button>
+        <button data-tool="color"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor"/></svg>フィルター</button>
         <button data-tool="effect"><svg viewBox="0 0 24 24"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/></svg>エフェクト</button>
         <button data-tool="crop"><svg viewBox="0 0 24 24"><path d="M6 2v14a2 2 0 0 0 2 2h14M2 6h14a2 2 0 0 1 2 2v14"/></svg>切り抜き</button>
         <button data-tool="speed"><svg viewBox="0 0 24 24"><path d="M12 14l4-4"/><path d="M3.3 17a9 9 0 1 1 17.4 0"/></svg>速度</button>

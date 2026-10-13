@@ -2,6 +2,7 @@
 // 見た目が完全に一致する。
 import { cropRect } from './project.js';
 import { fontString } from './fonts.js';
+import { glProc, colorActive, chromaActive } from './gl.js';
 
 const clamp01 = (v) => Math.min(1, Math.max(0, v));
 const easeOut = (x) => 1 - Math.pow(1 - x, 3);
@@ -88,7 +89,7 @@ export function renderFrame(ctx, W, H, p, t, drawSource, opt = {}) {
     for (const ov of p.overlays || []) {
       if (t < ov.start || t >= ov.end) continue;
       const src = opt.overlaySource(ov);
-      if (src) drawOverlay(ctx, ov, W, H, opt.staticText === ov.id ? null : t, src);
+      if (src) drawOverlay(ctx, resolveKf(ov, t), W, H, opt.staticText === ov.id ? null : t, src);
     }
   }
 
@@ -101,7 +102,7 @@ export function renderFrame(ctx, W, H, p, t, drawSource, opt = {}) {
         ctx.rotate(fx.txt.rot);
         ctx.translate(-W / 2, -H / 2);
       }
-      drawText(ctx, c, W, H, opt.staticText === c.id ? null : t);
+      drawText(ctx, resolveKf(c, t), W, H, opt.staticText === c.id ? null : t);
       ctx.restore();
     }
   }
@@ -295,7 +296,14 @@ export function drawOverlay(ctx, ov, W, H, t, src) {
   ctx.clip();
   if (ov.flip) ctx.scale(-1, 1);
   ctx.imageSmoothingQuality = 'high';
-  src.draw(ctx, -r.w / 2, -r.h / 2, r.w, r.h);
+  if (colorActive(ov.color) || chromaActive(ov.chroma)) {
+    // グリーンバック合成・色調補正（表示される大きさで加工）
+    const tf = ctx.getTransform ? ctx.getTransform() : { a: 1, b: 0 };
+    const k = Math.min(1, Math.hypot(tf.a, tf.b) * (r.w / src.w));
+    const out = glProc().process((g, w, h) => src.draw(g, 0, 0, w, h), src.w * k, src.h * k, ov.color, ov.chroma);
+    if (out) ctx.drawImage(out, -r.w / 2, -r.h / 2, r.w, r.h);
+    else src.draw(ctx, -r.w / 2, -r.h / 2, r.w, r.h);
+  } else src.draw(ctx, -r.w / 2, -r.h / 2, r.w, r.h);
   ctx.restore();
   if (ov.border && ov.border.on && ov.border.width > 0) {
     overlayPath(ctx, ov, r.w, r.h);
@@ -304,4 +312,24 @@ export function drawOverlay(ctx, ov, W, H, t, src) {
     ctx.stroke();
   }
   ctx.restore();
+}
+
+// --- キーフレーム ---------------------------------------------------------
+// item.kf = [{ t（クリップ内の秒）, x, y, size|scale, rot, opacity }]。時刻 t の値を補間して返す
+export const KF_PROPS = ['x', 'y', 'size', 'scale', 'rot', 'opacity'];
+export function resolveKf(item, t) {
+  const kf = item.kf;
+  if (!kf || !kf.length || t == null) return item;
+  const lt = t - item.start;
+  let a = kf[0], b = kf[kf.length - 1], k = 0;
+  if (lt <= a.t) b = a;
+  else if (lt >= b.t) a = b;
+  else {
+    for (let i = 0; i < kf.length - 1; i++) if (lt >= kf[i].t && lt <= kf[i + 1].t) { a = kf[i]; b = kf[i + 1]; break; }
+    const u = (lt - a.t) / Math.max(1e-6, b.t - a.t);
+    k = u * u * (3 - 2 * u);
+  }
+  const out = { ...item };
+  for (const p of KF_PROPS) if (a[p] != null && b[p] != null) out[p] = a[p] + (b[p] - a[p]) * k;
+  return out;
 }

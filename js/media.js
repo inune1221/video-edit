@@ -5,6 +5,7 @@ import {
   CanvasSource, AudioBufferSource, Conversion, canEncodeVideo, canEncodeAudio,
 } from './vendor/mediabunny.min.mjs';
 import { renderFrame } from './render.js';
+import { mainNeeds, drawMain } from './compose.js';
 import { outputSize, timelineDuration, clipTimes, fitRect } from './project.js';
 import { mixProject, SR, resample, timeStretch } from './audio.js';
 
@@ -106,8 +107,9 @@ class MemoryFile {
   toBlob(type) { return new Blob(this.parts.map((p) => p.data), { type }); }
 }
 
+// 高画質: iPhone のカメラと同じくらい（4K30 の H.264 で約 47Mbps）、最高画質: その約1.6倍
 export function bitrateFor(w, h, fps, codec, quality) {
-  const bpp = (quality === 'max' ? 0.28 : 0.17) * (codec === 'hevc' ? 0.6 : 1);
+  const bpp = (quality === 'max' ? 0.3 : 0.19) * (codec === 'hevc' ? 0.6 : 1);
   return Math.round(Math.min(160e6, w * h * fps * bpp));
 }
 
@@ -209,11 +211,29 @@ export async function exportVideo({ srcs, proj, buffers, overlayMedia = new Map(
 
     // 3) 映像
     const frames = Math.max(1, Math.round(dur * fps));
-    // クリップごとに、使うフレームの範囲と素材の時刻を決める
-    const runs = clipTimes(proj).map((x, k, all) => {
-      const i0 = Math.round(x.start * fps), i1 = k === all.length - 1 ? frames : Math.round(x.end * fps);
-      return { x, i0, i1 };
-    }).filter((r) => r.i1 > r.i0);
+    // メイン動画: フレームごとに必要なクリップと素材の時刻を先に決め、クリップごとに順番に取り出す
+    // （トランジション中は2つのクリップを同時に使う）
+    const ts = clipTimes(proj);
+    const plan = [];
+    const perClip = ts.map(() => []);
+    for (let k = 0; k < frames; k++) {
+      const needs = mainNeeds(proj, k / fps, ts);
+      plan.push(needs);
+      for (const n of needs) perClip[n.x.index].push({ k, st: n.st });
+    }
+    const lastUse = perClip.map((l) => (l.length ? l[l.length - 1].k : -1));
+    const clipReaders = new Map();
+    const clipReader = (idx) => {
+      let r = clipReaders.get(idx);
+      if (!r) {
+        const s = srcs.get(ts[idx].clip.srcId).media;
+        const off = s.firstTimestamp, last = off + s.info.duration - 0.5 / (s.info.fps || fps);
+        const times = perClip[idx].map((u) => Math.min(last, Math.max(off, off + u.st + 1e-4)));
+        r = new VideoSampleSink(s.videoTrack).samplesAtTimestamps(times)[Symbol.asyncIterator]();
+        clipReaders.set(idx, r);
+      }
+      return r;
+    };
     // 重ねる動画: 使うフレームの時刻を先に全部決めておき、順番に取り出す
     const overlays = proj.overlays || [];
     const active = (ov, t) => t >= ov.start && t < ov.end;
@@ -234,19 +254,20 @@ export async function exportVideo({ srcs, proj, buffers, overlayMedia = new Map(
     }
     const t0 = performance.now();
     let i = 0;
-    for (const { x, i0, i1 } of runs) {
-     if (signal?.aborted) break;
-     const s = srcs.get(x.clip.srcId).media;
-     const sink = new VideoSampleSink(s.videoTrack);
-     const off = s.firstTimestamp;
-     const lastSrc = off + Math.min(x.clip.out, s.info.duration) - 0.5 / (s.info.fps || fps);
-     const fr = fitRect(proj.frame, s.info.width, s.info.height, x.clip.fit);
-     function* times() {
-       for (let k = i0; k < i1; k++) yield Math.min(lastSrc, off + x.clip.in + (k / fps - x.start) * x.clip.speed + 1e-4);
-     }
-     for await (const sample of sink.samplesAtTimestamps(times())) {
-      if (signal?.aborted) { sample?.close(); break; }
+    for (let i0 = 0; i0 < frames; i0++) {
+      if (signal?.aborted) break;
       const t = i / fps;
+      const mainSamples = new Map();
+      for (const n of plan[i]) {
+        const { value } = await clipReader(n.x.index).next();
+        if (value) mainSamples.set(n.x.index, value);
+      }
+      const getFrame = (x) => {
+        const sm = mainSamples.get(x.index);
+        if (!sm) return null;
+        const info = srcs.get(x.clip.srcId).media.info;
+        return { w: info.width, h: info.height, draw: (c, X, Y, Wd, Hd) => sm.draw(c, X, Y, Wd, Hd) };
+      };
       const cur = new Map();
       for (const ov of overlays) {
         const r = readers.get(ov.id);
@@ -259,9 +280,10 @@ export async function exportVideo({ srcs, proj, buffers, overlayMedia = new Map(
         const s = cur.get(ov.id);
         return s ? { w: m.width, h: m.height, draw: (c, x, y, w, h) => s.draw(c, x, y, w, h) } : null;
       };
-      renderFrame(ctx, W, H, proj, t, (c) => { if (sample) sample.draw(c, fr.x, fr.y, fr.w, fr.h); }, { overlaySource });
-      sample?.close();
+      renderFrame(ctx, W, H, proj, t, (c) => drawMain(c, proj, t, getFrame), { overlaySource });
+      for (const sm of mainSamples.values()) sm.close();
       for (const s of cur.values()) s.close();
+      for (const n of plan[i]) if (lastUse[n.x.index] === i) { clipReaders.get(n.x.index)?.return?.(); clipReaders.delete(n.x.index); }
       await videoSource.add(t, 1 / fps);
       i++;
       if (i % 5 === 0 || i === frames) {
@@ -269,8 +291,8 @@ export async function exportVideo({ srcs, proj, buffers, overlayMedia = new Map(
         report('video', i / frames, { eta: (el / i) * (frames - i), frame: i, frames });
       }
     }
-    }
     for (const r of readers.values()) r.return?.();
+    for (const r of clipReaders.values()) r.return?.();
     if (signal?.aborted) throw new DOMException('canceled', 'AbortError');
     videoSource.close();
     report('finalize', 1);
