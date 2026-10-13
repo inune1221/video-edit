@@ -83,6 +83,15 @@ export function renderFrame(ctx, W, H, p, t, drawSource, opt = {}) {
   drawSource(ctx);
   ctx.restore();
 
+  // 重ねた画像・動画（メイン動画の上、文字の下）
+  if (opt.overlaySource) {
+    for (const ov of p.overlays || []) {
+      if (t < ov.start || t >= ov.end) continue;
+      const src = opt.overlaySource(ov);
+      if (src) drawOverlay(ctx, ov, W, H, opt.staticText === ov.id ? null : t, src);
+    }
+  }
+
   if (!opt.hideText) {
     for (const c of p.texts) {
       if (t < c.start || t >= c.end) continue;
@@ -242,4 +251,57 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.arcTo(x, y + h, x, y, r);
   ctx.arcTo(x, y, x + w, y, r);
   ctx.closePath();
+}
+
+// --- 重ねる画像・動画 ---------------------------------------------------------
+
+// 画面上の位置と大きさ（中心・幅・高さ・回転）。scale は出力の幅に対する割合
+export function overlayRect(ov, W, H, srcW, srcH) {
+  const w = ov.scale * W;
+  const h = (w * srcH) / Math.max(1, srcW);
+  return { cx: ov.x * W, cy: ov.y * H, w, h, rot: (ov.rot * Math.PI) / 180 };
+}
+
+function overlayPath(ctx, ov, w, h) {
+  ctx.beginPath();
+  if (ov.shape === 'circle') ctx.ellipse(0, 0, w / 2, h / 2, 0, 0, Math.PI * 2);
+  else if (ov.shape === 'round') roundRect(ctx, -w / 2, -h / 2, w, h, Math.min(w, h) * 0.12);
+  else ctx.rect(-w / 2, -h / 2, w, h);
+}
+
+// src: { w, h, draw(ctx, x, y, w, h) }
+export function drawOverlay(ctx, ov, W, H, t, src) {
+  const a = t == null ? { alpha: 1, scale: 1, dy: 0 } : animState(ov, t);
+  if (a.alpha <= 0) return;
+  const r = overlayRect(ov, W, H, src.w, src.h);
+  ctx.save();
+  ctx.translate(r.cx, r.cy + a.dy * r.h * 0.4);
+  ctx.rotate(r.rot);
+  ctx.scale(a.scale, a.scale);
+  ctx.globalAlpha *= ov.opacity * a.alpha;
+  const base = Math.min(W, H);
+  if (ov.shadow) {
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,.55)';
+    ctx.shadowBlur = base * 0.04;
+    ctx.shadowOffsetY = base * 0.012;
+    overlayPath(ctx, ov, r.w, r.h);
+    ctx.fillStyle = '#000';
+    ctx.fill();
+    ctx.restore();
+  }
+  ctx.save();
+  overlayPath(ctx, ov, r.w, r.h);
+  ctx.clip();
+  if (ov.flip) ctx.scale(-1, 1);
+  ctx.imageSmoothingQuality = 'high';
+  src.draw(ctx, -r.w / 2, -r.h / 2, r.w, r.h);
+  ctx.restore();
+  if (ov.border && ov.border.on && ov.border.width > 0) {
+    overlayPath(ctx, ov, r.w, r.h);
+    ctx.lineWidth = ov.border.width * base;
+    ctx.strokeStyle = ov.border.color;
+    ctx.stroke();
+  }
+  ctx.restore();
 }

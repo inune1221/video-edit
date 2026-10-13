@@ -128,8 +128,9 @@ export function mixProject(p, orig, buffers, afx = null) {
     for (let i = 0; i < n; i++) { L[i] += l[i] * g; R[i] += r[i] * g; }
   }
 
-  for (const a of p.audios) {
-    const buf = buffers.get(a.id);
+  // 追加した音声と、重ねた動画の音声
+  const clips = [...p.audios.map((a) => [a, buffers.get(a.id)]), ...(p.overlays || []).filter((o) => o.type === 'video').map((o) => [o, buffers.get(o.mediaId)])];
+  for (const [a, buf] of clips) {
     if (!buf || a.volume <= 0) continue;
     const l = buf.getChannelData(0), r = buf.numberOfChannels > 1 ? buf.getChannelData(1) : l;
     const s0 = Math.max(0, Math.round(a.start * SR));

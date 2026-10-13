@@ -2,12 +2,13 @@
 import {
   createProject, timelineDuration, toSource, toTimeline, ASPECTS, cropForAspect, outputSize,
   assignLanes, TEXT_PRESETS, newTextClip, applyPreset, EFFECT_TYPES, newEffect, newAudioClip,
-  snapshot, restore, newId,
+  snapshot, restore, newId, newOverlay,
 } from './project.js';
-import { renderFrame, drawText, textBounds } from './render.js';
+import { renderFrame, drawText, textBounds, overlayRect } from './render.js';
 import { FONTS, fontByKey, addFontCss, ensureFont } from './fonts.js';
 import { decodeAudioFile, computePeaks, resample, SR } from './audio.js';
 import { openVideo, decodeSourceAudio, exportVideo, detectEncoders, bitrateFor } from './media.js';
+import { CanvasSink } from './vendor/mediabunny.min.mjs';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -55,6 +56,8 @@ const S = {
   audio: { ctx: null, gain: null, nodes: [], elemOk: false, src: null, fx: null, fxLoading: null },
   expectScroll: -1,
   // 音声補正
+  ovMedia: new Map(), // 重ねる素材 mediaId -> { type, file, url, bitmap, width, height, duration, fps, thumb }
+  ovEls: new Map(), // 試聴用の <video>（重ねる動画クリップごと）
   analysis: null, afxWorker: null, afxReady: false, afxGain: 0, afxAB: 'proc', afxView: 'basic', afxSel: 1,
 };
 const video = $('video');
@@ -120,6 +123,10 @@ async function loadFile(file) {
     S.proj = createProject(media.info);
     S.buffers.clear();
     S.peaks.clear();
+    for (const el of S.ovEls.values()) { el.pause(); el.remove(); }
+    S.ovEls.clear();
+    for (const m of S.ovMedia.values()) if (m.url) URL.revokeObjectURL(m.url);
+    S.ovMedia.clear();
     S.origPeaks = null;
     S.thumbs = [];
     S.history = [];
@@ -244,11 +251,26 @@ function draw() {
     return;
   }
   // 停止中は、選択中の文字をアニメーションなしの完成形で表示する（編集しやすいように）
-  const staticText = !S.playing && S.sel?.kind === 'text' ? S.sel.id : null;
-  renderFrame(pctx, W, H, S.proj, S.t, drawSourceFromVideo, { staticText });
+  const staticText = !S.playing && (S.sel?.kind === 'text' || S.sel?.kind === 'overlay') ? S.sel.id : null;
+  syncOverlayVideos();
+  renderFrame(pctx, W, H, S.proj, S.t, drawSourceFromVideo, { staticText, overlaySource: previewOverlaySource });
+  if (S.sel && S.sel.kind === 'overlay') {
+    const ov = findItem('overlay', S.sel.id), m = ov && S.ovMedia.get(ov.mediaId);
+    if (ov && m && S.t >= ov.start && S.t < ov.end) {
+      const b = overlayRect(ov, W, H, m.width, m.height);
+      pctx.save();
+      pctx.translate(b.cx, b.cy);
+      pctx.rotate(b.rot);
+      pctx.setLineDash([6, 4]);
+      pctx.lineWidth = 2;
+      pctx.strokeStyle = '#fff';
+      pctx.strokeRect(-b.w / 2, -b.h / 2, b.w, b.h);
+      pctx.restore();
+    }
+  }
   // 選択中の文字の枠
-  if (S.sel && S.sel.kind === 'text') {
-    const c = findItem('text', S.sel.id);
+  if (S.sel && (S.sel.kind === 'text' || S.sel.kind === 'overlay')) {
+    const c = S.sel.kind === 'text' && findItem('text', S.sel.id);
     if (c && S.t >= c.start && S.t < c.end) {
       const b = textBounds(pctx, c, W, H);
       pctx.save();
@@ -347,9 +369,9 @@ async function play() {
   $('playIcon').innerHTML = '<path d="M7 5h3v14H7zM14 5h3v14h-3z"/>';
   // 追加した音声を鳴らす
   const now = ctx.currentTime + 0.03;
-  for (const a of S.proj.audios) {
-    const buf = S.buffers.get(a.id);
-    if (!buf || a.end <= S.t) continue;
+  const clips = [...S.proj.audios.map((a) => [a, S.buffers.get(a.id)]), ...S.proj.overlays.filter((o) => o.type === 'video').map((o) => [o, S.buffers.get(o.mediaId)])];
+  for (const [a, buf] of clips) {
+    if (!buf || a.end <= S.t || a.volume <= 0) continue;
     const src = ctx.createBufferSource();
     src.buffer = buf;
     const g = ctx.createGain();
@@ -399,6 +421,7 @@ function pause() {
   if (!S.playing) return;
   S.playing = false;
   video.pause();
+  for (const el of S.ovEls.values()) el.pause();
   for (const n of S.audio.nodes) { try { n.stop(); } catch {} }
   S.audio.nodes = [];
   $('playIcon').innerHTML = '<path d="M8 5v14l11-7z"/>';
@@ -433,11 +456,10 @@ tl.addEventListener('gesturechange', (e) => { e.preventDefault(); setZoom(gestur
 function findItem(kind, id) {
   if (!S.proj) return null;
   if (kind === 'video') return S.proj;
-  const list = kind === 'text' ? S.proj.texts : kind === 'effect' ? S.proj.effects : S.proj.audios;
-  return list.find((x) => x.id === id) || null;
+  return listOf(kind).find((x) => x.id === id) || null;
 }
 function listOf(kind) {
-  return kind === 'text' ? S.proj.texts : kind === 'effect' ? S.proj.effects : S.proj.audios;
+  return { text: S.proj.texts, effect: S.proj.effects, overlay: S.proj.overlays, audio: S.proj.audios }[kind];
 }
 
 function waveCanvas(peaks, from, to, widthPx) {
@@ -458,7 +480,7 @@ function waveCanvas(peaks, from, to, widthPx) {
   return c;
 }
 
-const ROW = { ruler: 22, video: 50, effect: 26, text: 28, audio: 34, gap: 4 };
+const ROW = { ruler: 22, video: 50, effect: 26, overlay: 32, text: 28, audio: 34, gap: 4 };
 
 function renderTimeline() {
   if (!S.proj) return;
@@ -529,11 +551,13 @@ function renderTimeline() {
     y += count * (rowH + 3) + ROW.gap;
   };
   lanesFor(p.effects, 'effect', 'effect', ROW.effect, (e) => '✦ ' + EFFECT_TYPES.find((x) => x.key === e.type).label);
+  lanesFor(p.overlays, 'overlay', 'overlay', ROW.overlay, (o) => (o.type === 'video' ? '🎞 ' : '🖼 ') + o.name,
+    (o) => { const m = S.ovMedia.get(o.mediaId); return m && m.thumb ? h('img', { class: 'ov-thumb', src: m.thumb }) : null; });
   lanesFor(p.texts, 'text', 'text', ROW.text, (c) => 'T ' + c.text.replace(/\n/g, ' '));
   lanesFor(p.audios, 'audio', (a) => (a.kind === 'tts' ? 'tts' : 'audio'), ROW.audio, (a) => (a.kind === 'tts' ? '🗣 ' : '♪ ') + a.name,
     (a, w) => { const pk = S.peaks.get(a.id); return pk ? waveCanvas(pk, a.offset, a.offset + (a.end - a.start), w) : null; });
 
-  if (!p.texts.length && !p.audios.length && !p.effects.length) {
+  if (!p.texts.length && !p.audios.length && !p.effects.length && !p.overlays.length) {
     tlInner.append(h('div', { class: 'tl-hint', style: { left: pad + 'px', top: y + 4 + 'px' } }, '下のボタンから文字・音楽・エフェクトを追加'));
     y += 24;
   }
@@ -624,7 +648,9 @@ function dragClip(dx) {
   }
   const it = findItem(d.kind, d.id);
   const total = dur();
-  const buf = d.kind === 'audio' ? S.buffers.get(it.id) : null;
+  const ovm = d.kind === 'overlay' && it.type === 'video' ? S.ovMedia.get(it.mediaId) : null;
+  const hasOffset = d.kind === 'audio' || !!ovm;
+  const srcLen = d.kind === 'audio' ? S.buffers.get(it.id)?.duration : ovm ? ovm.duration : null;
   if (!d.handle) {
     const len = d.o.end - d.o.start;
     let s = Math.max(0, d.o.start + dt);
@@ -634,12 +660,12 @@ function dragClip(dx) {
     it.start = s;
     it.end = s + len;
   } else if (d.handle === 'l') {
-    const minStart = d.kind === 'audio' ? Math.max(0, d.o.start - d.o.offset) : 0;
+    const minStart = hasOffset ? Math.max(0, d.o.start - d.o.offset) : 0;
     let s = clamp(snapT(d.o.start + dt, it.id), minStart, d.o.end - 0.1);
     it.start = s;
-    if (d.kind === 'audio') it.offset = d.o.offset + (s - d.o.start);
+    if (hasOffset) it.offset = d.o.offset + (s - d.o.start);
   } else {
-    const maxEnd = buf ? d.o.start + (buf.duration - d.o.offset) : total + 600;
+    const maxEnd = srcLen ? d.o.start + (srcLen - d.o.offset) : total + 600;
     it.end = clamp(snapT(d.o.end + dt, it.id), d.o.start + 0.1, maxEnd);
   }
   d.el.style.left = tl.clientWidth / 2 + it.start * S.pps + 'px';
@@ -686,6 +712,7 @@ function splitItem(kind, id) {
   if (t <= it.start + 0.05 || t >= it.end - 0.05) { toast('再生位置（白い線）をクリップの途中に合わせてください'); return; }
   const b = { ...JSON.parse(JSON.stringify(it)), id: newId(kind[0]), start: t };
   if (kind === 'audio') { b.offset = it.offset + (t - it.start); S.buffers.set(b.id, S.buffers.get(it.id)); S.peaks.set(b.id, S.peaks.get(it.id)); }
+  if (kind === 'overlay') b.offset = it.offset + (t - it.start);
   it.end = t;
   listOf(kind).push(b);
   commit();
@@ -725,7 +752,7 @@ stage.addEventListener('pointerdown', (e) => {
   const r = preview.getBoundingClientRect();
   if (pointers.size === 2 && stageDrag) {
     const [a, b] = [...pointers.values()];
-    stageDrag.pinch = { d0: Math.hypot(a.x - b.x, a.y - b.y), size: stageDrag.target?.size, crop: { ...S.proj.crop } };
+    stageDrag.pinch = { d0: Math.hypot(a.x - b.x, a.y - b.y), size: stageDrag.target?.size, scale: stageDrag.target?.scale, crop: { ...S.proj.crop } };
     return;
   }
   if (pointers.size > 1) return;
@@ -745,14 +772,27 @@ stage.addEventListener('pointerdown', (e) => {
     const m = 12 * (preview.width / r.width);
     if (Math.abs(lx) <= b.w / 2 + m && Math.abs(ly) <= b.h / 2 + m) { hit = c; break; }
   }
-  if (hit) {
-    const wasSel = S.sel?.kind === 'text' && S.sel.id === hit.id;
-    if (!wasSel) {
-      S.sel = { kind: 'text', id: hit.id };
-      if (S.panel && S.panel !== 'item') closePanel(true);
-      if (S.panel === 'item') openItemPanel('text', hit.id); else renderTimeline();
+  let hitKind = 'text';
+  if (!hit) {
+    // 重ねた画像・動画（上にあるものから）
+    const ovs = S.proj.overlays.filter((o) => S.t >= o.start && S.t < o.end);
+    for (let i = ovs.length - 1; i >= 0; i--) {
+      const o = ovs[i], m = S.ovMedia.get(o.mediaId);
+      if (!m) continue;
+      const b = overlayRect(o, preview.width, preview.height, m.width, m.height);
+      const dx = px - b.cx, dy = py - b.cy;
+      const lx = dx * Math.cos(-b.rot) - dy * Math.sin(-b.rot), ly = dx * Math.sin(-b.rot) + dy * Math.cos(-b.rot);
+      if (Math.abs(lx) <= b.w / 2 && Math.abs(ly) <= b.h / 2) { hit = o; hitKind = 'overlay'; break; }
     }
-    stageDrag = { type: 'text', target: hit, x: e.clientX, y: e.clientY, o: { x: hit.x, y: hit.y }, r, moved: false, wasSel };
+  }
+  if (hit) {
+    const wasSel = S.sel?.kind === hitKind && S.sel.id === hit.id;
+    if (!wasSel) {
+      S.sel = { kind: hitKind, id: hit.id };
+      if (S.panel && S.panel !== 'item') closePanel(true);
+      if (S.panel === 'item') openItemPanel(hitKind, hit.id); else renderTimeline();
+    }
+    stageDrag = { type: hitKind, target: hit, x: e.clientX, y: e.clientY, o: { x: hit.x, y: hit.y }, r, moved: false, wasSel };
     requestDraw();
   } else {
     stageDrag = { type: 'none', x: e.clientX, y: e.clientY, moved: false };
@@ -768,6 +808,7 @@ stage.addEventListener('pointermove', (e) => {
     const k = Math.hypot(a.x - b.x, a.y - b.y) / Math.max(10, d.pinch.d0);
     d.moved = true;
     if (d.type === 'text') d.target.size = clamp(d.pinch.size * k, 0.015, 0.6);
+    else if (d.type === 'overlay') d.target.scale = clamp(d.pinch.scale * k, 0.03, 3);
     else if (d.type === 'crop') scaleCrop(d.pinch.crop, 1 / k);
     requestDraw();
     return;
@@ -775,7 +816,7 @@ stage.addEventListener('pointermove', (e) => {
   const dx = e.clientX - d.x, dy = e.clientY - d.y;
   if (!d.moved && Math.hypot(dx, dy) < 4) return;
   d.moved = true;
-  if (d.type === 'text') {
+  if (d.type === 'text' || d.type === 'overlay') {
     let x = d.o.x + dx / d.r.width;
     S.guideX = Math.abs(x - 0.5) < 0.015;
     if (S.guideX) x = 0.5;
@@ -800,7 +841,7 @@ const stageUp = (e) => {
   if (!d) return;
   if (d.moved) { commit(); if (d.type === 'crop') layoutPreview(); refreshPanelValues(); requestDraw(); return; }
   if (e.type === 'pointercancel') return;
-  if (d.type === 'text' && d.wasSel && S.panel !== 'item') openItemPanel('text', d.target.id);
+  if ((d.type === 'text' || d.type === 'overlay') && d.wasSel && S.panel !== 'item') openItemPanel(d.type, d.target.id);
   else if (d.type === 'none' && (!S.panel || S.panel === 'audio')) { S.playing ? pause() : play(); }
 };
 stage.addEventListener('pointerup', stageUp);
@@ -850,11 +891,12 @@ function openPanel(name, title) {
 function openItemPanel(kind, id) {
   if (kind === 'video') { openPanel('audio'); return; }
   S.sel = { kind, id };
-  openPanel('item', kind === 'text' ? 'テキスト' : kind === 'effect' ? 'エフェクト' : '音声');
+  openPanel('item', { text: 'テキスト', effect: 'エフェクト', overlay: '重ねる素材', audio: '音声' }[kind]);
   const body = $('panelBody');
   const it = findItem(kind, id);
   if (kind === 'text') buildText(body, it);
   else if (kind === 'effect') buildEffect(body, it);
+  else if (kind === 'overlay') buildOverlay(body, it);
   else buildAudio(body, it);
 }
 
@@ -1686,6 +1728,155 @@ function buildAudioFx(body) {
 }
 
 // ---------------------------------------------------------------------------
+// 重ねる画像・動画（オーバーレイ）
+
+function previewOverlaySource(ov) {
+  const m = S.ovMedia.get(ov.mediaId);
+  if (!m) return null;
+  if (m.type === 'image') return { w: m.width, h: m.height, draw: (c, x, y, w, h) => c.drawImage(m.bitmap, x, y, w, h) };
+  const el = S.ovEls.get(ov.id);
+  if (!el || el.readyState < 2) return null;
+  return { w: m.width, h: m.height, draw: (c, x, y, w, h) => c.drawImage(el, x, y, w, h) };
+}
+
+function ovEl(ov) {
+  let el = S.ovEls.get(ov.id);
+  if (!el) {
+    const m = S.ovMedia.get(ov.mediaId);
+    el = document.createElement('video');
+    el.className = 'ov-el';
+    el.muted = true;
+    el.playsInline = true;
+    el.setAttribute('playsinline', '');
+    el.preload = 'auto';
+    el.src = m.url;
+    el.addEventListener('seeked', requestDraw);
+    el.addEventListener('loadeddata', requestDraw);
+    $('stage').append(el);
+    S.ovEls.set(ov.id, el);
+  }
+  return el;
+}
+
+// 試聴用の <video> を、メインの再生位置に合わせる
+function syncOverlayVideos() {
+  if (!S.proj) return;
+  const ids = new Set();
+  for (const ov of S.proj.overlays) {
+    if (ov.type !== 'video' || !S.ovMedia.has(ov.mediaId)) continue;
+    ids.add(ov.id);
+    const active = S.t >= ov.start && S.t < ov.end;
+    const el = S.ovEls.get(ov.id) || (active ? ovEl(ov) : null);
+    if (!el) continue;
+    if (!active) { if (!el.paused) el.pause(); continue; }
+    const want = ov.offset + (S.t - ov.start);
+    if (S.playing) {
+      if (el.paused) { el.currentTime = want; el.play().catch(() => {}); }
+      else if (Math.abs(el.currentTime - want) > 0.25) el.currentTime = want;
+    } else {
+      if (!el.paused) el.pause();
+      if (!el.seeking && Math.abs(el.currentTime - want) > 0.02) el.currentTime = want;
+    }
+  }
+  for (const [id, el] of S.ovEls) if (!ids.has(id)) { el.pause(); el.remove(); S.ovEls.delete(id); }
+}
+
+async function addOverlayFile(file) {
+  if (!file) return;
+  const isVideo = file.type.startsWith('video/') || /\.(mov|mp4|m4v|webm)$/i.test(file.name);
+  toast(isVideo ? '動画を読み込み中…' : '画像を読み込み中…', 20000);
+  try {
+    const id = newId('m');
+    const m = { id, type: isVideo ? 'video' : 'image', name: file.name.replace(/\.[^.]+$/, ''), file };
+    const th = h('canvas');
+    if (isVideo) {
+      const md = await openVideo(file);
+      Object.assign(m, { width: md.info.width, height: md.info.height, duration: md.info.duration, fps: md.info.fps, url: URL.createObjectURL(file) });
+      try {
+        const sink = new CanvasSink(md.videoTrack, { height: 64 });
+        const wc = await sink.getCanvas(md.firstTimestamp + Math.min(0.5, md.info.duration / 2));
+        if (wc) m.thumb = wc.canvas.toDataURL('image/jpeg', 0.6);
+      } catch {}
+      if (md.audioTrack) {
+        try {
+          const a = await decodeSourceAudio(md, 0, md.info.duration);
+          if (a) {
+            const chs = a.channels.map((c) => resample(c, a.sampleRate, SR));
+            const buf = new AudioBuffer({ length: chs[0].length, numberOfChannels: 2, sampleRate: SR });
+            buf.copyToChannel(chs[0], 0);
+            buf.copyToChannel(chs[1] || chs[0], 1);
+            S.buffers.set(id, buf);
+          }
+        } catch (e) { console.warn('overlay audio', e); }
+      }
+    } else {
+      m.bitmap = await createImageBitmap(file);
+      m.width = m.bitmap.width;
+      m.height = m.bitmap.height;
+      const k = 64 / m.height;
+      th.width = Math.max(1, Math.round(m.width * k)); th.height = 64;
+      th.getContext('2d').drawImage(m.bitmap, 0, 0, th.width, th.height);
+      m.thumb = th.toDataURL('image/jpeg', 0.7);
+    }
+    S.ovMedia.set(id, m);
+    const o = outputSize(S.proj);
+    const ov = newOverlay(clamp(S.t, 0, Math.max(0, dur() - 0.1)), m, o.w, o.h);
+    if (!isVideo) ov.end = Math.min(ov.end, Math.max(ov.start + 0.5, dur()));
+    S.proj.overlays.push(ov);
+    commit();
+    $('toast').hidden = true;
+    openItemPanel('overlay', ov.id);
+  } catch (e) {
+    console.error(e);
+    toast('このファイルは読み込めませんでした');
+  }
+}
+$('ovFile').addEventListener('change', (e) => addOverlayFile(e.target.files[0]));
+
+function buildOverlay(body, ov) {
+  const m = S.ovMedia.get(ov.mediaId);
+  const place = (k) => {
+    const o = outputSize(S.proj);
+    const wf = ov.scale, hf = m ? (ov.scale * o.w * (m.height / m.width)) / o.h : ov.scale;
+    const mg = 0.04;
+    if (k === 'full') { ov.rot = 0; const fit = m ? Math.min(1, (o.h / o.w) * (m.width / m.height)) : 1; ov.scale = fit; ov.x = 0.5; ov.y = 0.5; return; }
+    ov.x = k.includes('l') ? mg + wf / 2 : k.includes('r') ? 1 - mg - wf / 2 : 0.5;
+    ov.y = k.includes('t') ? mg + hf / 2 : k.includes('b') ? 1 - mg - hf / 2 : 0.5;
+  };
+  body.append(sec(m ? `${ov.type === 'video' ? '動画' : '画像'}：${ov.name}（${m.width}×${m.height}）` : ov.name,
+    h('div', { class: 'btn-row' }, ...[['tl', '左上'], ['tr', '右上'], ['c', '中央'], ['bl', '左下'], ['br', '右下'], ['full', '全画面']].map(([k, l]) =>
+      h('button', { onclick: () => { place(k); commit(); refreshPanelValues(); requestDraw(); } }, l))),
+    slider({ label: '大きさ', min: 0.03, max: 1.5, step: 0.005, get: () => ov.scale, set: (v) => (ov.scale = v), show: (v) => Math.round(v * 100) + '%' }),
+    slider({ label: '横位置', min: 0, max: 1, step: 0.005, get: () => ov.x, set: (v) => (ov.x = v), show: (v) => Math.round(v * 100) + '' }),
+    slider({ label: '縦位置', min: 0, max: 1, step: 0.005, get: () => ov.y, set: (v) => (ov.y = v), show: (v) => Math.round(v * 100) + '' }),
+    slider({ label: '回転', min: -180, max: 180, step: 1, get: () => ov.rot, set: (v) => (ov.rot = v), show: (v) => v + '°' }),
+    slider({ label: '不透明度', min: 0.05, max: 1, step: 0.01, get: () => ov.opacity, set: (v) => (ov.opacity = v), show: (v) => Math.round(v * 100) + '%' }),
+    h('p', { class: 'lbl' }, 'プレビュー上でドラッグして移動、2本指で拡大縮小できます。')));
+  const borderDetail = h('div', {},
+    colors({ get: () => ov.border.color, set: (v) => (ov.border.color = v) }),
+    slider({ label: '太さ', min: 0.002, max: 0.04, step: 0.001, get: () => ov.border.width, set: (v) => (ov.border.width = v), show: (v) => Math.round(v * 1000) / 10 + '' }));
+  refreshers.push(() => (borderDetail.hidden = !ov.border.on));
+  borderDetail.hidden = !ov.border.on;
+  body.append(sec('見た目',
+    chips({ options: [{ v: 'rect', label: '四角' }, { v: 'round', label: '角丸' }, { v: 'circle', label: '円' }], get: () => ov.shape, set: (v) => (ov.shape = v) }),
+    toggle({ label: '縁取り', get: () => ov.border.on, set: (v) => { ov.border.on = v; refreshPanelValues(); } }), borderDetail,
+    toggle({ label: '影', get: () => ov.shadow, set: (v) => (ov.shadow = v) }),
+    toggle({ label: '左右反転', get: () => ov.flip, set: (v) => (ov.flip = v) }),
+    h('div', { class: 'sec-title' }, '出かた'),
+    chips({ options: [{ v: 'none', label: 'なし' }, { v: 'fade', label: 'フェード' }, { v: 'pop', label: 'ポン' }, { v: 'slide', label: '下から' }], get: () => ov.anim, set: (v) => (ov.anim = v) })));
+  if (ov.type === 'video') {
+    body.append(sec('音声',
+      S.buffers.get(ov.mediaId)
+        ? slider({ label: '音量', min: 0, max: 2, step: 0.01, get: () => ov.volume, set: (v) => (ov.volume = v), show: (v) => Math.round(v * 100) + '%' })
+        : h('p', { class: 'lbl' }, 'この動画には音声がありません')));
+  }
+  body.append(timingButtons(ov));
+  body.append(h('div', { class: 'btn-row' },
+    h('button', { onclick: () => duplicateItem('overlay', ov.id) }, '複製'),
+    h('button', { class: 'danger', style: { color: 'var(--danger)' }, onclick: () => deleteItem('overlay', ov.id) }, '削除')));
+}
+
+// ---------------------------------------------------------------------------
 // ツール
 
 $('tools').addEventListener('click', (e) => {
@@ -1694,6 +1885,7 @@ $('tools').addEventListener('click', (e) => {
   const tool = b.dataset.tool;
   if (tool === 'text') addText();
   else if (tool === 'music') { $('audioFile').value = ''; $('audioFile').click(); }
+  else if (tool === 'overlay') { $('ovFile').value = ''; $('ovFile').click(); }
   else if (tool === 'effect') openPanel('effectPick');
   else openPanel(tool);
 });
@@ -1763,7 +1955,7 @@ async function startExport() {
     $('runMsg').textContent = '音声補正の音量を計算中…';
     const afx = await afxExportParams();
     const res = await exportVideo({
-      media: S.media, proj: S.proj, buffers: S.buffers,
+      media: S.media, proj: S.proj, buffers: S.buffers, overlayMedia: S.ovMedia,
       settings: { ...EXP, afx },
       signal: exportAbort.signal,
       onProgress: (phase, k, extra) => {

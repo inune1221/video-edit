@@ -123,7 +123,8 @@ export async function detectEncoders(w, h, fps, extra = []) {
 }
 
 // settings: { limit: 'auto'|1080|720, fps, codec: 'avc'|'hevc', quality: 'high'|'max' }
-export async function exportVideo({ media, proj, buffers, settings, onProgress, signal }) {
+// overlayMedia: Map(mediaId -> { type, file, bitmap, width, height, duration, fps })（重ねる画像・動画）
+export async function exportVideo({ media, proj, buffers, overlayMedia = new Map(), settings, onProgress, signal }) {
   const report = (phase, k, extra) => onProgress && onProgress(phase, k, extra);
   const { w: W, h: H } = outputSize(proj, settings.limit);
   const fps = settings.fps;
@@ -136,7 +137,7 @@ export async function exportVideo({ media, proj, buffers, settings, onProgress, 
     orig = await decodeSourceAudio(media, proj.trimIn, proj.trimOut, (k) => report('audio', k * 0.7));
   }
   if (signal?.aborted) throw new DOMException('canceled', 'AbortError');
-  const hasAudio = !!orig || proj.audios.some((a) => buffers.get(a.id));
+  const hasAudio = !!orig || proj.audios.some((a) => buffers.get(a.id)) || (proj.overlays || []).some((o) => o.type === 'video' && o.volume > 0 && buffers.get(o.mediaId));
   const mix = hasAudio ? mixProject(proj, orig, buffers, settings.afx) : null;
   orig = null;
   report('audio', 1);
@@ -193,13 +194,44 @@ export async function exportVideo({ media, proj, buffers, settings, onProgress, 
     function* times() {
       for (let i = 0; i < frames; i++) yield Math.min(lastSrc, off + proj.trimIn + (i / fps) * proj.speed + 1e-4);
     }
+    // 重ねる動画: 使うフレームの時刻を先に全部決めておき、順番に取り出す
+    const overlays = proj.overlays || [];
+    const active = (ov, t) => t >= ov.start && t < ov.end;
+    const readers = new Map();
+    for (const ov of overlays) {
+      const m = overlayMedia.get(ov.mediaId);
+      if (!m || m.type !== 'video') continue;
+      const inp = new Input({ source: new BlobSource(m.file), formats: ALL_FORMATS });
+      const vt = await inp.getPrimaryVideoTrack();
+      const ft = await vt.getFirstTimestamp();
+      const ts = [];
+      const last = ft + m.duration - 0.5 / (m.fps || 30);
+      for (let k = 0; k < frames; k++) {
+        const t = k / fps;
+        if (active(ov, t)) ts.push(Math.min(last, ft + ov.offset + (t - ov.start) + 1e-4));
+      }
+      readers.set(ov.id, new VideoSampleSink(vt).samplesAtTimestamps(ts)[Symbol.asyncIterator]());
+    }
     const t0 = performance.now();
     let i = 0;
     for await (const sample of sink.samplesAtTimestamps(times())) {
       if (signal?.aborted) { sample?.close(); break; }
       const t = i / fps;
-      renderFrame(ctx, W, H, proj, t, (c) => { if (sample) sample.draw(c, 0, 0, srcW, srcH); });
+      const cur = new Map();
+      for (const ov of overlays) {
+        const r = readers.get(ov.id);
+        if (r && active(ov, t)) { const { value } = await r.next(); if (value) cur.set(ov.id, value); }
+      }
+      const overlaySource = (ov) => {
+        const m = overlayMedia.get(ov.mediaId);
+        if (!m) return null;
+        if (m.type === 'image') return { w: m.width, h: m.height, draw: (c, x, y, w, h) => c.drawImage(m.bitmap, x, y, w, h) };
+        const s = cur.get(ov.id);
+        return s ? { w: m.width, h: m.height, draw: (c, x, y, w, h) => s.draw(c, x, y, w, h) } : null;
+      };
+      renderFrame(ctx, W, H, proj, t, (c) => { if (sample) sample.draw(c, 0, 0, srcW, srcH); }, { overlaySource });
       sample?.close();
+      for (const s of cur.values()) s.close();
       await videoSource.add(t, 1 / fps);
       i++;
       if (i % 5 === 0 || i === frames) {
@@ -207,6 +239,7 @@ export async function exportVideo({ media, proj, buffers, settings, onProgress, 
         report('video', i / frames, { eta: (el / i) * (frames - i), frame: i, frames });
       }
     }
+    for (const r of readers.values()) r.return?.();
     if (signal?.aborted) throw new DOMException('canceled', 'AbortError');
     videoSource.close();
     report('finalize', 1);

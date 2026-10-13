@@ -22,6 +22,7 @@ export function createProject(src) {
     texts: [],
     audios: [],
     effects: [],
+    overlays: [], // 重ねる画像・動画
     afx: null, // 元の動画の音声の補正（EQ・エフェクト）。最初に「音声補正」を開いたときに作る
   };
 }
@@ -179,3 +180,25 @@ export function newAudioClip(start, buffer, name, kind = 'music') {
 // 保存・元に戻す用に、AudioBuffer などを含まない形で複製する
 export const snapshot = (p) => JSON.stringify({ ...p, src: undefined });
 export const restore = (p, json) => Object.assign(p, JSON.parse(json), { src: p.src });
+
+// 重ねる画像・動画。m: 読み込んだ素材の情報 { id, type: 'image'|'video', name, width, height, duration }
+export function newOverlay(start, m, outW, outH) {
+  const isVideo = m.type === 'video';
+  // 小さめ（ワイプ）に置く。縦長の素材は高さで合わせる
+  const aspect = (m.height / m.width) * (outW / outH);
+  const scale = aspect > 1 ? 0.45 / aspect : 0.45;
+  return {
+    id: newId('o'),
+    mediaId: m.id,
+    type: m.type,
+    name: m.name,
+    start,
+    end: start + (isVideo ? m.duration : 4),
+    offset: 0, // 動画の何秒目から使うか
+    x: 0.5, y: 0.5, scale, rot: 0, opacity: 1,
+    shape: 'rect', flip: false, shadow: false,
+    border: { on: false, color: '#ffffff', width: 0.008 },
+    anim: 'fade',
+    volume: isVideo ? 1 : 0, fadeIn: 0, fadeOut: 0,
+  };
+}

@@ -177,3 +177,8 @@ details summary { font-size: 13px; color: var(--accent-text); padding: 6px 0; }
 .center-row { display: flex; align-items: center; gap: 10px; padding: 24px 4px; }
 .spinner.sm { width: 20px; height: 20px; border-width: 2px; }
 input[type=range] { accent-color: #7a8bff; }
+
+/* ---- 重ねる素材 ---- */
+.clip.overlay .body { background: #1f7a7a; padding-left: 44px; }
+.clip .ov-thumb { position: absolute; left: 0; top: 0; height: 100%; width: 40px; object-fit: cover; opacity: .9; }
+.stage video.ov-el { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; pointer-events: none; }
