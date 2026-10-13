@@ -2571,7 +2571,7 @@ $('audioFile').addEventListener('change', async (e) => {
 // ---------------------------------------------------------------------------
 // 書き出し
 
-const EXP = { limit: 'auto', fps: 30, codec: 'avc', quality: 'high', split: false };
+const EXP = { limit: 'auto', fps: 30, codec: 'avc', quality: 'max', split: false };
 let exportResults = [];
 let exportAbort = null, exportResult = null, encCaps = null;
 
@@ -2602,13 +2602,13 @@ async function openExport() {
     const hi = bitrateFor(s.w, s.h, EXP.fps, EXP.codec, 'high'), mx = bitrateFor(s.w, s.h, EXP.fps, EXP.codec, 'max');
     const mb = ((br + 256000) * dur()) / 8 / 1e6;
     $('expEstimate').textContent = `${s.w}×${s.h}・${+EXP.fps.toFixed(2)}fps・約${Math.round(br / 1e6)}Mbps・予想サイズ 約${mb < 10 ? mb.toFixed(1) : Math.round(mb)}MB（${fmt(dur())}）`
-      + `\n画質の違いはビットレート（1秒あたりのデータ量）だけです。高画質＝iPhoneのカメラと同じくらい（約${Math.round(hi / 1e6)}Mbps）、最高画質＝その約1.6倍（約${Math.round(mx / 1e6)}Mbps）。細かい模様や動きの激しい場面で差が出ます。`;
+      + `\nビットレート＝1秒あたりのデータ量。高＝iPhoneのカメラと同じくらい（約${Math.round(hi / 1e6)}Mbps）、最高＝その約1.6倍（約${Math.round(mx / 1e6)}Mbps）。細かい模様や動きの激しい場面で差が出ます。`;
   };
   box.append(
     h('div', { class: 'sec-title' }, '解像度'), chips({ options: resOpts, get: () => EXP.limit, set: (v) => (EXP.limit = v), onChange: est }),
     h('div', { class: 'sec-title' }, 'フレームレート'), chips({ options: fpsOpts, get: () => EXP.fps, set: (v) => (EXP.fps = v), onChange: est }),
     h('div', { class: 'sec-title' }, '形式'), chips({ options: [{ v: 'avc', label: 'H.264（互換性重視）' }, { v: 'hevc', label: 'HEVC（同じ画質で小さめ）' }], get: () => EXP.codec, set: (v) => (EXP.codec = v), onChange: est }),
-    h('div', { class: 'sec-title' }, '画質'), chips({ options: [{ v: 'high', label: '高画質' }, { v: 'max', label: '最高画質（容量大）' }], get: () => EXP.quality, set: (v) => (EXP.quality = v), onChange: est }),
+    h('div', { class: 'sec-title' }, 'ビットレート'), chips({ options: [{ v: 'max', label: '最高（容量大）' }, { v: 'high', label: '高' }], get: () => EXP.quality, set: (v) => (EXP.quality = v), onChange: est }),
   );
   const ng = groupsOf(p).length;
   if (ng > 1) {
