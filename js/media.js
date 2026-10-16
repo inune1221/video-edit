@@ -135,11 +135,13 @@ export async function buildMainAudio(proj, srcs, onProgress) {
   for (const x of ts) {
     const s = srcs.get(x.clip.srcId);
     if (!s || !s.media.audioTrack || x.clip.volume <= 0) continue;
-    const a = await decodeSourceAudio(s.media, x.clip.in, x.clip.out);
+    const a = await decodeSourceAudio(s.media, x.clip.in, x.clip.out, (k) => onProgress && onProgress((x.index + k * 0.5) / ts.length));
     if (!a) continue;
     let chs = a.channels.map((c) => resample(c, a.sampleRate, SR));
     if (chs.length < 2) chs = [chs[0], chs[0]];
-    chs = timeStretch(chs, x.clip.speed, x.clip.keepPitch);
+    const base = x.index / ts.length, span = 1 / ts.length;
+    onProgress && onProgress(base + span * 0.5);
+    chs = await timeStretch(chs, x.clip.speed, x.clip.keepPitch, (k) => onProgress && onProgress(base + span * (0.5 + 0.5 * k)));
     const at = Math.round(x.start * SR), n = Math.min(chs[0].length, Math.round((x.end - x.start) * SR), total - at);
     const g = x.clip.volume;
     for (let i = 0; i < n; i++) { L[at + i] += chs[0][i] * g; R[at + i] += chs[1][i] * g; }
@@ -157,14 +159,16 @@ export async function exportVideo({ srcs, proj, buffers, overlayMedia = new Map(
   const dur = timelineDuration(proj);
 
   // 1) 音声
-  report('audio', 0);
+  report('decode', 0);
   let orig = null;
-  if (proj.origVolume > 0) orig = await buildMainAudio(proj, srcs, (k) => report('audio', k * 0.7));
+  if (proj.origVolume > 0) orig = await buildMainAudio(proj, srcs, (k) => report('decode', k));
+  report('decode', 1);
   if (signal?.aborted) throw new DOMException('canceled', 'AbortError');
   const hasAudio = !!orig || proj.audios.some((a) => buffers.get(a.id)) || (proj.overlays || []).some((o) => o.type === 'video' && o.volume > 0 && buffers.get(o.mediaId));
-  const mix = hasAudio ? mixProject(proj, orig, buffers, settings.afx) : null;
+  report('mix', 0);
+  const mix = hasAudio ? await mixProject(proj, orig, buffers, settings.afx, (k) => report('mix', k)) : null;
   orig = null;
-  report('audio', 1);
+  report('mix', 1);
 
   // 2) エンコーダーの準備
   const enc = await detectEncoders(W, H, fps, [settings.codec]);
@@ -205,6 +209,7 @@ export async function exportVideo({ srcs, proj, buffers, overlayMedia = new Map(
         ab.copyToChannel(mix[0].subarray(i, i + n), 0);
         ab.copyToChannel(mix[1].subarray(i, i + n), 1);
         await audioSource.add(ab);
+        report('encodeAudio', (i + n) / mix[0].length);
       }
       audioSource.close();
     }
@@ -252,6 +257,7 @@ export async function exportVideo({ srcs, proj, buffers, overlayMedia = new Map(
       }
       readers.set(ov.id, new VideoSampleSink(vt).samplesAtTimestamps(ts)[Symbol.asyncIterator]());
     }
+    report('video', 0, { frame: 0, frames });
     const t0 = performance.now();
     let i = 0;
     for (let i0 = 0; i0 < frames; i0++) {

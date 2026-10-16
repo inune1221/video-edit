@@ -38,7 +38,9 @@ onmessage = (e) => {
         break;
       case 'gain':
         if (L.length < fs * 0.5) { reply({ gain: 0 }); break; }
-        reply({ gain: DSP.solveOutGain(fs, L, R, m.params, m.target, m.quick !== false) });
+        let last = -1;
+        const prog = (x) => { const v = Math.floor(x * 50); if (v !== last) { last = v; postMessage({ id: m.id, progress: x }); } };
+        reply({ gain: DSP.solveOutGain(fs, L, R, m.params, m.target, m.quick !== false, prog) });
         break;
     }
   } catch (err) {

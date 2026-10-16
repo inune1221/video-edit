@@ -207,3 +207,13 @@ input[type=range] { accent-color: #7a8bff; }
 .saved-info { flex: 1; min-width: 0; font-size: 14px; }
 .saved-info > div:first-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chip.danger { color: var(--danger); }
+
+/* ---- 書き出しの進み具合 ---- */
+.run-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-top: 4px; }
+#runPct { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.steps { margin: 6px 0; font-size: 13px; }
+.step { display: grid; grid-template-columns: 20px 1fr auto; gap: 6px; padding: 4px 0; color: var(--muted); }
+.step.st-run { color: var(--text); font-weight: 600; }
+.step.st-done .step-ico { color: #30d158; }
+.step.st-run .step-ico { color: var(--accent-text); }
+.step-r { font-variant-numeric: tabular-nums; }

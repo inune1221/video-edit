@@ -1695,10 +1695,10 @@ function newAfx() {
 // 解析用ワーカー
 let afxReq = 0;
 const afxPending = new Map();
-function afxCall(type, data = {}, transfer = []) {
+function afxCall(type, data = {}, transfer = [], onProgress) {
   return new Promise((resolve, reject) => {
     const id = ++afxReq;
-    afxPending.set(id, { resolve, reject });
+    afxPending.set(id, { resolve, reject, onProgress });
     S.afxWorker.postMessage({ id, type, ...data }, transfer);
   });
 }
@@ -1709,6 +1709,7 @@ function startAfxWorker() {
   S.afxWorker.onmessage = (e) => {
     const r = e.data, p = afxPending.get(r.id);
     if (!p) return;
+    if (r.progress != null && r.gain == null && r.analysis === undefined && !r.error) { p.onProgress && p.onProgress(r.progress); return; }
     afxPending.delete(r.id);
     r.error ? p.reject(new Error(r.error)) : p.resolve(r);
   };
@@ -1779,13 +1780,15 @@ function afxChanged(gain = true) {
   drawEqGraph();
 }
 
-async function afxExportParams() {
+// 書き出し前に音量合わせを正確に計算し直す（onProgress(0〜1)）
+const afxNeedsGain = () => { const a = S.proj && S.proj.afx; return !!(a && a.on && a.loud !== 'off' && S.afxReady === true); };
+async function afxExportParams(onProgress) {
   const p = afxParams();
   if (!p) return null;
   const a = S.proj.afx;
-  if (a.loud !== 'off' && S.afxReady === true) {
+  if (afxNeedsGain()) {
     try {
-      const r = await afxCall('gain', { params: { ...p, outGain: 0 }, target: LOUD[a.loud], quick: false });
+      const r = await afxCall('gain', { params: { ...p, outGain: 0 }, target: LOUD[a.loud], quick: false }, [], onProgress);
       p.outGain = r.gain;
     } catch (e) { console.warn(e); }
   }
@@ -2624,6 +2627,118 @@ async function openExport() {
   } catch {}
 }
 
+// ---------------------------------------------------------------------------
+// 書き出しの進み具合（工程ごとの表示・全体の％・残り時間）
+// 残り時間は「前回までの書き出しで測った速さ」から予測し、実際の進み具合で補正する
+
+const RATE_KEY = 'videdit.rates.v1';
+const RATE_DEFAULT = { gain: 0.02, decode: 0.02, stretch: 0.015, mix: 0.004, mixFx: 0.03, video: 0.015 };
+function loadRates() { try { return { ...RATE_DEFAULT, ...JSON.parse(localStorage.getItem(RATE_KEY) || '{}') }; } catch { return { ...RATE_DEFAULT }; } }
+function saveRates(r) { try { localStorage.setItem(RATE_KEY, JSON.stringify(r)); } catch {} }
+
+const fmtSec = (s) => {
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return `${s}秒`;
+  const m = Math.floor(s / 60), r = s % 60;
+  return r ? `${m}分${r}秒` : `${m}分`;
+};
+
+class ExportProgress {
+  constructor(jobs, opt) {
+    this.rates = loadRates();
+    this.t0 = performance.now();
+    this.steps = [];
+    const R = this.rates;
+    if (opt.gain) this.steps.push({ key: 'gain', job: -1, label: '音量合わせの計算', units: opt.gainSeconds, rate: 'gain' });
+    jobs.forEach((j, k) => {
+      const pre = jobs.length > 1 ? `${k + 1}本目: ` : '';
+      const d = timelineDuration(j.proj);
+      const slow = j.proj.clips.some((c) => c.speed !== 1);
+      this.steps.push({ key: 'decode', job: k, label: pre + '動画の音声を読み込み' + (slow ? '・速度変更' : ''), units: d, rate: slow ? 'stretch' : 'decode', extra: slow ? d * R.decode : 0 });
+      this.steps.push({ key: 'mix', job: k, label: pre + '音声の処理（' + (opt.afx ? '補正・' : '') + 'ミックス）', units: d, rate: opt.afx ? 'mixFx' : 'mix' });
+      const o = outputSize(j.proj, EXP.limit);
+      const frames = Math.max(1, Math.round(d * EXP.fps));
+      this.steps.push({ key: 'video', job: k, label: pre + `映像の書き出し（${frames}フレーム）`, units: frames * (o.w * o.h) / 1e6, rate: 'video', frames });
+      this.steps.push({ key: 'finalize', job: k, label: pre + 'ファイルの仕上げ', units: 0, fixed: 0.5 + d * 0.01 });
+    });
+    for (const s of this.steps) { s.est = s.fixed != null ? s.fixed : s.units * R[s.rate] + (s.extra || 0); s.f = 0; s.state = 'wait'; }
+    this.cur = -1;
+    this.detail = '';
+    this.render(true);
+    this.timer = setInterval(() => this.render(), 500);
+  }
+  // 工程 key（job 番号つき）に進む。k: その工程の進み具合 0〜1
+  set(key, job, k, detail) {
+    const i = this.steps.findIndex((s) => s.key === key && s.job === job);
+    if (i < 0) return;
+    if (i !== this.cur) {
+      const now = performance.now();
+      for (let j = 0; j < i; j++) {
+        const s = this.steps[j];
+        if (s.state !== 'done') { s.state = 'done'; s.f = 1; s.t1 = now; if (s.t0 == null) s.t0 = now; this.learn(s); }
+      }
+      this.cur = i;
+      const s = this.steps[i];
+      s.state = 'run';
+      s.t0 = now;
+    }
+    this.steps[i].f = Math.min(1, Math.max(this.steps[i].f, k));
+    if (detail != null) this.detail = detail;
+    this.render();
+  }
+  // 実際にかかった時間から速さを覚える
+  learn(s) {
+    if (!s.rate || !s.units || s.t0 == null) return;
+    const actual = (s.t1 - s.t0) / 1000 - (s.extra || 0);
+    if (actual <= 0.05) return;
+    const r = actual / s.units;
+    this.rates[s.rate] = this.rates[s.rate] * 0.4 + r * 0.6;
+  }
+  finish() {
+    const now = performance.now();
+    for (const s of this.steps) if (s.state !== 'done') { s.state = 'done'; s.f = 1; s.t1 = now; if (s.t0 == null) s.t0 = now; this.learn(s); }
+    saveRates(this.rates);
+    this.stop();
+  }
+  stop() { clearInterval(this.timer); }
+  remaining() {
+    const now = performance.now();
+    // 終わった工程で「予測より何倍かかったか」を出し、これからの工程の予測にかける
+    let est = 0, act = 0;
+    for (const s of this.steps) if (s.state === 'done' && s.t1 != null) { est += s.est; act += (s.t1 - s.t0) / 1000; }
+    const ratio = est > 1 ? clamp(act / est, 0.3, 4) : 1;
+    let rem = 0;
+    this.steps.forEach((s, i) => {
+      if (s.state === 'done') return;
+      if (i === this.cur && s.t0 != null) {
+        const el = (now - s.t0) / 1000;
+        if (s.f > 0.03 && el > 1.5) rem += (el / s.f) * (1 - s.f);
+        else rem += Math.max(0, s.est * ratio - el);
+      } else rem += s.est * ratio;
+    });
+    return rem;
+  }
+  render(first) {
+    const total = this.steps.reduce((a, s) => a + s.est, 0) || 1;
+    const done = this.steps.reduce((a, s) => a + s.est * (s.state === 'done' ? 1 : s.f), 0);
+    const pct = Math.min(99.5, (done / total) * 100);
+    const el = (performance.now() - this.t0) / 1000;
+    $('prog').style.width = pct.toFixed(1) + '%';
+    $('runPct').textContent = `全体 ${Math.floor(pct)}%`;
+    $('runEta').textContent = first || el < 2 ? '残り時間を計算中…' : `残り 約${fmtSec(this.remaining())}（経過 ${fmtSec(el)}）`;
+    const list = $('runSteps');
+    list.innerHTML = '';
+    for (const s of this.steps) {
+      const right = s.state === 'done' ? (s.t1 && s.t0 ? fmtSec((s.t1 - s.t0) / 1000) : '') : s.state === 'run' ? `${Math.floor(s.f * 100)}%` : '';
+      list.append(h('div', { class: 'step st-' + s.state },
+        h('span', { class: 'step-ico' }, s.state === 'done' ? '✓' : s.state === 'run' ? '▶' : '・'),
+        h('span', { class: 'step-lbl' }, s.label),
+        h('span', { class: 'step-r' }, right)));
+    }
+    $('runMsg').textContent = this.detail;
+  }
+}
+
 async function startExport() {
   $('expSettings').hidden = true;
   $('expRun').hidden = false;
@@ -2631,40 +2746,38 @@ async function startExport() {
   $('runTitle').textContent = '書き出し中…';
   $('runMsg').textContent = '準備中…';
   exportAbort = new AbortController();
-  let wake = null;
+  let wake = null, prog = null;
   try { wake = await navigator.wakeLock?.request('screen'); } catch {}
   try {
     await Promise.all(S.proj.texts.map((c) => ensureFont(c.font, c.text)));
-    $('runMsg').textContent = '音声補正の音量を計算中…';
-    const afx = await afxExportParams();
     const base = (S.srcs.get(S.proj.clips[0].srcId).info.name || 'video').replace(/\.[^.]+$/, '');
     const stamp = new Date().toTimeString().slice(0, 8).replace(/:/g, '');
     const jobs = EXP.split
       ? groupsOf(S.proj).map((g, k) => ({ proj: subProject(S.proj, g), name: `${base}_${stamp}_${String(k + 1).padStart(2, '0')}` }))
       : [{ proj: S.proj, name: null }];
+    const useAfx = !!afxParams();
+    prog = new ExportProgress(jobs, { gain: afxNeedsGain(), gainSeconds: dur(), afx: useAfx });
+    if (afxNeedsGain()) prog.set('gain', -1, 0, '補正後の音の大きさを、目標の音量に合わせる計算をしています');
+    const afx = await afxExportParams((k) => prog.set('gain', -1, k));
     const results = [];
     for (let k = 0; k < jobs.length; k++) {
       const job = jobs[k];
-      const head = jobs.length > 1 ? `（${k + 1}/${jobs.length}本目）` : '';
-      $('runTitle').textContent = '書き出し中…' + head;
+      $('runTitle').textContent = '書き出し中…' + (jobs.length > 1 ? `（${k + 1}/${jobs.length}本目）` : '');
       const res = await exportVideo({
         srcs: S.srcs, proj: job.proj, buffers: S.buffers, overlayMedia: S.ovMedia,
         settings: { ...EXP, afx, name: job.name },
         signal: exportAbort.signal,
         onProgress: (phase, kk, extra) => {
-          let pct, msg;
-          if (phase === 'audio') { pct = kk * 8; msg = '音声を処理中…'; }
-          else if (phase === 'video') {
-            pct = 8 + kk * 90;
-            const eta = extra?.eta;
-            msg = `映像を書き出し中… ${extra?.frame}/${extra?.frames} フレーム` + (eta != null && extra.frame > 20 ? `・残り約${eta >= 60 ? Math.ceil(eta / 60) + '分' : Math.ceil(eta) + '秒'}` : '');
-          } else { pct = 99; msg = 'ファイルを仕上げ中…'; }
-          $('prog').style.width = ((k + pct / 100) / jobs.length * 100).toFixed(1) + '%';
-          $('runMsg').textContent = msg;
+          if (phase === 'decode') prog.set('decode', k, kk, '動画の音声を取り出しています');
+          else if (phase === 'mix') prog.set('mix', k, kk * 0.85, useAfx ? 'EQ・エフェクトをかけて、音楽と混ぜています' : '音楽や読み上げと混ぜています');
+          else if (phase === 'encodeAudio') prog.set('mix', k, 0.85 + kk * 0.15, '音声を書き込んでいます');
+          else if (phase === 'video') prog.set('video', k, kk, extra ? `フレーム ${extra.frame} / ${extra.frames}` : '');
+          else if (phase === 'finalize') prog.set('finalize', k, 0.5, 'ファイルをまとめています');
         },
       });
       results.push(res);
     }
+    prog.finish();
     for (const r of exportResults) URL.revokeObjectURL(r.url);
     exportResults = results.map((r) => ({ ...r, url: URL.createObjectURL(r.file) }));
     exportResult = exportResults[0].file;
@@ -2692,6 +2805,7 @@ async function startExport() {
     $('expRun').hidden = true;
     $('expDone').hidden = false;
   } catch (e) {
+    prog && prog.stop();
     if (e.name === 'AbortError' || exportAbort.signal.aborted) { $('sheet').hidden = true; toast('書き出しを中止しました'); }
     else {
       console.error(e);

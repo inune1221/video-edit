@@ -57,8 +57,11 @@ function stretchRate(chs, speed) {
   });
 }
 
-// WSOLA による速度変更（声の高さを保つ）
-export function timeStretch(chs, speed, keepPitch = true) {
+// 重い処理の途中で画面を更新させるための待ち（進捗表示が止まらないように）
+export const yieldUI = () => new Promise((r) => setTimeout(r, 0));
+
+// WSOLA による速度変更（声の高さを保つ）。onProgress(0〜1)
+export async function timeStretch(chs, speed, keepPitch = true, onProgress) {
   if (Math.abs(speed - 1) < 1e-4) return chs;
   if (!keepPitch) return stretchRate(chs, speed);
   const N = 2048, Hs = N / 2, tol = 384;
@@ -72,7 +75,13 @@ export function timeStretch(chs, speed, keepPitch = true) {
   for (const ch of chs) for (let i = 0; i < len; i++) mono[i] += ch[i] / chs.length;
 
   let prevPos = 0; // 前のフレームで採用した入力位置
+  let lastYield = performance.now();
   for (let k = 0, o = 0; o < outLen; k++, o += Hs) {
+    if ((k & 63) === 0 && performance.now() - lastYield > 40) {
+      onProgress && onProgress(o / outLen);
+      await yieldUI();
+      lastYield = performance.now();
+    }
     const nominal = Math.round(o * speed);
     let best = nominal;
     if (k > 0) {
@@ -114,13 +123,14 @@ export function timeStretch(chs, speed, keepPitch = true) {
 // orig: [L, R] … メインの動画クリップをつなげた音声（48kHz、速度変更済み。media.js の buildMainAudio）。無ければ null
 // buffers: Map(audioClipId -> AudioBuffer)
 // afx: 動画の音声にかける EQ・エフェクトの設定（dsp.js の Chain の params）。null なら何もしない
-export function mixProject(p, orig, buffers, afx = null) {
+// onProgress(0〜1)
+export async function mixProject(p, orig, buffers, afx = null, onProgress) {
   const total = Math.ceil(timelineDuration(p) * SR);
   const L = new Float32Array(total), R = new Float32Array(total);
 
   if (orig && p.origVolume > 0) {
     let chs = orig;
-    if (afx && globalThis.DSP) chs = globalThis.DSP.processBuffers(SR, chs[0], chs[1], afx);
+    if (afx && globalThis.DSP) chs = await processBuffersAsync(SR, chs[0], chs[1], afx, onProgress);
     const l = chs[0], r = chs[1];
     const n = Math.min(total, l.length);
     const g = p.origVolume;
@@ -158,4 +168,34 @@ export function mixProject(p, orig, buffers, afx = null) {
     }
   }
   return [L, R];
+}
+
+// dsp.js の processBuffers と同じ処理を、途中で画面を更新しながら行う
+export async function processBuffersAsync(fs, chL, chR, params, onProgress) {
+  const DSP = globalThis.DSP;
+  const len = chL.length, BLOCK = 4096;
+  const chain = new DSP.Chain(fs);
+  chain.set(params);
+  const lat = params.limit !== false && !params.bypass ? chain.lim.L : 0;
+  const outL = new Float32Array(len), outR = new Float32Array(len);
+  const bl = new Float32Array(BLOCK), br = new Float32Array(BLOCK);
+  const end = len + lat;
+  let lastYield = performance.now();
+  for (let o = 0; o < end; o += BLOCK) {
+    const n = Math.min(BLOCK, end - o);
+    bl.fill(0); br.fill(0);
+    if (o < len) { const m = Math.min(n, len - o); bl.set(chL.subarray(o, o + m)); br.set(chR.subarray(o, o + m)); }
+    chain.process(bl, br, n, 'full');
+    for (let i = 0; i < n; i++) {
+      const q = o + i - lat;
+      if (q >= 0 && q < len) { outL[q] = bl[i]; outR[q] = br[i]; }
+    }
+    if (performance.now() - lastYield > 40) {
+      onProgress && onProgress(o / end);
+      await yieldUI();
+      lastYield = performance.now();
+    }
+  }
+  onProgress && onProgress(1);
+  return [outL, outR];
 }
